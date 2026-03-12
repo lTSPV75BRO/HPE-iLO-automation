@@ -12,6 +12,7 @@ Configuration:
     ILO_TIMEOUT      - Request timeout in seconds (default: 60)
     ILO_INPUT_FILE   - File with one iLO IP per line when using -f (default: ips.txt)
   Use -u/--user and -p/--password for CLI; password from ILO_PASSWORD if -p not set.
+  Different passwords per iLO: use --password-file with lines 'IP password' or 'IP,password'; -p is used as default for IPs not in the file.
 
   Multiple iLOs: pass several IPs (ilo_ip ilo_ip ...) or use -f/--file with one IP per line.
   With multiple targets, reboot is never prompted; use --reboot to reboot all after applying.
@@ -361,8 +362,8 @@ def _load_bios_settings_file(path: str) -> Tuple[Dict[str, str], Dict[str, str]]
     return attributes, metadata
 
 
-def _save_bios_settings_file(path: str, model: str, cpu_vendor: str, cpu_model: str, attributes: Dict[str, str]) -> None:
-    """Write BIOS settings to a text file with metadata header (Model, CPU, CPU_Model)."""
+def _bios_export_lines(model: str, cpu_vendor: str, cpu_model: str, attributes: Dict[str, str]) -> List[str]:
+    """Build BIOS export lines (header + key=value). Used for file write or screen output."""
     lines = [
         "# BIOS settings export from iLO Redfish",
         f"# Model={model}",
@@ -374,6 +375,12 @@ def _save_bios_settings_file(path: str, model: str, cpu_vendor: str, cpu_model: 
         v = attributes.get(k, "")
         v_flat = str(v).replace("\n", " ").replace("\r", "")
         lines.append(f"{k}={v_flat}")
+    return lines
+
+
+def _save_bios_settings_file(path: str, model: str, cpu_vendor: str, cpu_model: str, attributes: Dict[str, str]) -> None:
+    """Write BIOS settings to a text file with metadata header (Model, CPU, CPU_Model)."""
+    lines = _bios_export_lines(model, cpu_vendor, cpu_model, attributes)
     with open(path, "w", encoding=FILE_ENCODING) as f:
         f.write("\n".join(lines) + "\n")
 
@@ -385,10 +392,12 @@ def fetch_bios_settings(
     output_path: str,
     timeout: int = DEFAULT_TIMEOUT,
     verify_ssl: bool = True,
+    no_write: bool = False,
 ) -> Tuple[bool, str]:
     """
-    GET current BIOS Attributes and system model/CPU from iLO, write to a text file.
-    Returns (success: bool, message: str). File format: # Model=... # CPU=... # CPU_Model=... then key=value per line.
+    GET current BIOS Attributes and system model/CPU from iLO.
+    If no_write is False, write to output_path; if True, return the export text as the message (for printing).
+    Returns (success: bool, message: str).
     """
     client = None
     try:
@@ -405,6 +414,9 @@ def fetch_bios_settings(
         attrs = _get_attributes(client, BIOS_URI)
         if not attrs:
             return False, "No BIOS Attributes returned from iLO"
+        if no_write:
+            lines = _bios_export_lines(model, cpu_vendor, cpu_model, attrs)
+            return True, "\n".join(lines) + "\n"
         _save_bios_settings_file(output_path, model, cpu_vendor, cpu_model, attrs)
         return True, f"Saved {len(attrs)} attributes to {output_path} (Model={model}, CPU={cpu_vendor})"
     except Exception as e:
@@ -430,6 +442,32 @@ def _load_ips(path: str) -> List[str]:
     except OSError:
         raise
     return ips
+
+
+def _load_password_file(path: str) -> Dict[str, str]:
+    """
+    Load IP/host -> password from file. One entry per line.
+    Format: IP password  or  IP,password  or  IP:password  (first separator wins).
+    Lines starting with # and empty lines are skipped. Leading/trailing space trimmed.
+    """
+    out: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding=FILE_ENCODING, errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                for sep in (",", ":", " ", "\t"):
+                    if sep in line:
+                        idx = line.index(sep)
+                        ip_or_host = line[:idx].strip()
+                        pwd = line[idx + 1 :].strip()
+                        if ip_or_host:
+                            out[ip_or_host] = pwd
+                        break
+    except OSError:
+        raise
+    return out
 
 
 def probe_ilo_alive(
@@ -1127,7 +1165,13 @@ def main() -> int:
         help=f"File with one iLO IP per line; -f alone uses {DEFAULT_INPUT_FILE}",
     )
     parser.add_argument("-u", "--user", "--username", dest="user", default=DEFAULT_USERNAME, metavar="USER", help=f"iLO username (default: {DEFAULT_USERNAME})")
-    parser.add_argument("-p", "--password", default=DEFAULT_PASSWORD, help="iLO password (default: ILO_PASSWORD env)")
+    parser.add_argument("-p", "--password", default=DEFAULT_PASSWORD, help="iLO password (default: ILO_PASSWORD env). With --password-file, used as default for IPs not in file.")
+    parser.add_argument(
+        "--password-file",
+        metavar="FILE",
+        default=None,
+        help="File with per-iLO passwords: one line per host as 'IP password' or 'IP,password'. Overrides -p for those IPs.",
+    )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds for API calls (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--probe-timeout", type=int, default=PROBE_TIMEOUT, metavar="SEC", help=f"Timeout for iLO alive probe in seconds (default: {PROBE_TIMEOUT})")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification")
@@ -1172,7 +1216,12 @@ def main() -> int:
         "--fetch-bios-settings",
         metavar="FILE",
         default=None,
-        help="Fetch current BIOS and model/CPU from target(s), write to FILE (first successful node). No apply.",
+        help="Fetch current BIOS and model/CPU from target(s). Write to FILE unless --no-write (then print to screen). No apply.",
+    )
+    parser.add_argument(
+        "--no-write",
+        action="store_true",
+        help="With --fetch-bios-settings: do not write to file; print BIOS export to screen (e.g. when no write permission).",
     )
     parser.add_argument(
         "--no-bios",
@@ -1193,6 +1242,15 @@ def main() -> int:
         help="When using --bios-settings-file: only apply if server model and CPU match the file header.",
     )
     args = parser.parse_args()
+
+    # Load per-IP passwords if --password-file given (fallback: args.password for IPs not in file)
+    args.password_map = {}
+    if getattr(args, "password_file", None):
+        try:
+            args.password_map = _load_password_file(args.password_file)
+        except FileNotFoundError:
+            print(f"Error: Password file not found: {args.password_file}", file=sys.stderr)
+            return 2
 
     # --dry-run: show what would be applied; no targets or password required
     if args.dry_run:
@@ -1276,17 +1334,24 @@ def main() -> int:
 
     # Fetch BIOS from first responsive node and exit (no apply)
     if args.fetch_bios_settings:
-        if not args.password:
-            print("Error: Password required for --fetch-bios-settings. Set ILO_PASSWORD or use -p.", file=sys.stderr)
+        if not args.password and not args.password_map:
+            print("Error: Password required for --fetch-bios-settings. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
             return 2
+        no_write = getattr(args, "no_write", False)
         for i, ip in enumerate(targets, 1):
+            pwd = args.password_map.get(ip, args.password)
+            if not pwd:
+                if multi:
+                    print(f"[{i}/{len(targets)}] {ip}: No password; add to --password-file or set -p.", file=sys.stderr)
+                continue
             if multi:
                 print(f"[{i}/{len(targets)}] Trying {ip} ...", file=sys.stderr)
-            if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 continue
             ok, msg = fetch_bios_settings(
-                ip, args.user, args.password, args.fetch_bios_settings,
+                ip, args.user, pwd, args.fetch_bios_settings,
                 timeout=args.timeout, verify_ssl=not args.no_verify_ssl,
+                no_write=no_write,
             )
             if ok:
                 print(msg)
@@ -1296,21 +1361,26 @@ def main() -> int:
         return 1
 
     if args.reset_bios_to_default:
-        if not args.password:
-            print("Error: Password required for --reset-bios-to-default. Set ILO_PASSWORD or use -p.", file=sys.stderr)
+        if not args.password and not args.password_map:
+            print("Error: Password required for --reset-bios-to-default. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
             return 2
         print("Note: For nodes in a Nutanix cluster with running workloads, use rolling_restart -h on the CVM to restart nodes safely.")
         any_fail = 0
         for i, ip in enumerate(targets, 1):
+            pwd = args.password_map.get(ip, args.password)
+            if not pwd:
+                print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
+                any_fail = 1
+                continue
             if multi:
                 print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-            if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 print(f"iLO at {ip} not responding, skipping.", file=sys.stderr)
                 any_fail = 1
                 continue
             client = None
             try:
-                kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": args.password, "timeout": args.timeout}
+                kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": pwd, "timeout": args.timeout}
                 if not args.no_verify_ssl:
                     pass
                 else:
@@ -1338,14 +1408,15 @@ def main() -> int:
         return any_fail
 
     if args.debug_secure_boot:
-        if not args.password:
-            print("Error: Password required for --debug-secure-boot. Set ILO_PASSWORD or use -p.", file=sys.stderr)
-            return 2
         ip = targets[0]
-        if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+        pwd = args.password_map.get(ip, args.password)
+        if not pwd:
+            print("Error: Password required for --debug-secure-boot. Set ILO_PASSWORD or use -p, or add this host to --password-file.", file=sys.stderr)
+            return 2
+        if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
             print(f"iLO at {ip} not responding.", file=sys.stderr)
             return 1
-        kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": args.password, "timeout": args.timeout}
+        kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": pwd, "timeout": args.timeout}
         if not args.no_verify_ssl:
             pass
         else:
@@ -1367,8 +1438,8 @@ def main() -> int:
         return 0
 
     if args.check:
-        if not args.password:
-            print("Error: iLO password required for --check. Set ILO_PASSWORD or use -p.", file=sys.stderr)
+        if not args.password and not args.password_map:
+            print("Error: iLO password required for --check. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
             return 2
         check_cert_pem: Optional[str] = None
         if args.secure_boot_cert:
@@ -1389,9 +1460,14 @@ def main() -> int:
                 pass
         any_fail = 0
         for i, ip in enumerate(targets, 1):
+            pwd = args.password_map.get(ip, args.password)
+            if not pwd:
+                print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
+                any_fail = 1
+                continue
             if multi:
                 print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-            if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 print(f"iLO at {ip} not responding (timeout/unreachable), skipping.", file=sys.stderr)
                 any_fail = 1
                 continue
@@ -1403,7 +1479,7 @@ def main() -> int:
             code = check_bios(
                 ip,
                 args.user,
-                args.password,
+                pwd,
                 timeout=args.timeout,
                 verify_ssl=not args.no_verify_ssl,
                 extra_desired=extra,
@@ -1415,8 +1491,8 @@ def main() -> int:
                 any_fail = 1
         return any_fail
 
-    if not args.password:
-        print("Error: iLO password required. Set ILO_PASSWORD or use -p.", file=sys.stderr)
+    if not args.password and not args.password_map:
+        print("Error: iLO password required. Set ILO_PASSWORD, use -p, or provide --password-file with an entry per target.", file=sys.stderr)
         return 2
 
     desired_from_file: Optional[Dict[str, str]] = None
@@ -1468,9 +1544,14 @@ def main() -> int:
 
     any_fail = 0
     for i, ip in enumerate(targets, 1):
+        pwd = args.password_map.get(ip, args.password)
+        if not pwd:
+            print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
+            any_fail = 1
+            continue
         if multi:
             print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-        if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+        if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
             print(f"iLO at {ip} not responding (timeout/unreachable), skipping.", file=sys.stderr)
             any_fail = 1
             continue
@@ -1479,7 +1560,7 @@ def main() -> int:
             code, _ = set_bios(
                 ip,
                 args.user,
-                args.password,
+                pwd,
                 timeout=args.timeout,
                 verify_ssl=not args.no_verify_ssl,
                 prompt_reboot=prompt_reboot,

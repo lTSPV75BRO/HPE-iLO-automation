@@ -163,11 +163,13 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 |--------|-------------|
 | `ilo_ip` or `-f FILE` | One or more iLO IPs, or file with one IP per line |
 | `-u`, `-p` | Username and password |
+| `--password-file FILE` | Per-iLO passwords: one line per host as `IP password` or `IP,password`; `-p` used for IPs not in file |
 | `--check` | Compare current BIOS to desired (read-only); exit 0 if match |
 | `--dry-run` | Print desired attributes only; no connect or PATCH |
 | `--bios-settings-file FILE` | Apply BIOS from key=value file (optional Model/CPU header) |
 | `--bios-profile NAME` | Use named profile: `Nutanix_DL360G11_Intel`, `Nutanix_DL385G11_AMD` |
 | `--fetch-bios-settings FILE` | Export current BIOS + model/CPU from first target to FILE; then exit |
+| `--no-write` | With `--fetch-bios-settings`: do not write to file; print BIOS export to screen (e.g. when no write permission) |
 | `--no-bios` | Do not apply any BIOS (only Secure Boot / cert / reboot if requested) |
 | `--match-model-cpu` | With file: apply only if server model and CPU match file header |
 | `--enable-secure-boot` | Enable Secure Boot (Redfish + BIOS attributes) |
