@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Secrets and local config (do not commit passwords or keys)
+*.cer
+*.pem
+*.key
+.env.local
+.env.*.local
+ips.txt
+*password*
+*secret*
+
+# Optional: keep a sample ips.txt.example if you want to commit an example
+# ips.txt
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+*.log.html
+*.tmp
+.cache/
+
+# Optional: uncomment to ignore CSV/output if they contain sensitive data
+# *.csv
+# foundation.csv
+# inventory.csv

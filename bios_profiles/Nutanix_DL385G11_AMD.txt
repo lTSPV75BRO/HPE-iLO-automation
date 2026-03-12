@@ -1,0 +1,18 @@
+# BIOS settings for HPE ProLiant DL385 Gen11 (AMD) – Nutanix Virtualization-MaxPerformance
+# Use with: HPE_set_bios.py -f ips.txt -p '...' --bios-settings-file bios_profiles/Nutanix_DL385G11_AMD.txt
+# Or: --bios-profile Nutanix_DL385G11_AMD
+# Model=ProLiant DL385 Gen11
+# CPU=AMD
+# CPU_Model=AMD EPYC
+
+CollabPowerControl=Disabled
+EnergyPerfBias=MaxPerf
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PerformanceDeterminism=PerformanceDeterministic
+PowerRegulator=StaticHighPerf
+ProcX2Apic=ForceEnabled
+WorkloadProfile=Virtualization-MaxPerformance
+XGMIForceLinkWidth=x16
+XGMIMaxLinkWidth=x16
+iSCSISoftwareInitiator=Disabled

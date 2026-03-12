@@ -1,0 +1,11 @@
+# HPE iLO Redfish inventory (HPEilodetials.py)
+# Python 3.6+ required; 3.8+ recommended for python-ilorest-library.
+
+# HPE Redfish client (provides RedfishClient for iLO).
+# If you see "cannot import name 'RedfishClient'" or "(unknown location)":
+# After "pip uninstall redfish" a broken redfish folder can remain. Fix:
+#   pip3 uninstall python-ilorest-library redfish -y
+#   pip3 install -r requirements.txt
+# Or remove the folder and reinstall: rm -rf <site-packages>/redfish
+# then: pip3 install --force-reinstall python-ilorest-library
+python-ilorest-library>=3.0.0
