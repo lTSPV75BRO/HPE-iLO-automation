@@ -15,6 +15,8 @@ Production-ready Python scripts for HPE iLO Redfish: inventory collection and BI
 - [Exit codes](#exit-codes)
 - [Repository structure](#repository-structure)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
+- [Contributing](#contributing)
 
 ## Scripts
 
@@ -150,6 +152,8 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --no-bios \
 ├── HPEilodetials.py         # Inventory collection
 ├── requirements.txt         # Python dependencies
 ├── README.md                # This file
+├── LICENSE                  # MIT License
+├── CONTRIBUTING.md          # Contribution guidelines
 ├── ips.txt.example          # Example IP list (copy to ips.txt)
 ├── .gitignore
 └── bios_profiles/
@@ -165,3 +169,11 @@ Do not commit `ips.txt` (real IPs) or passwords; use environment variables or se
 - **Certificate import fails:** Ensure BIOS/Platform is in **User mode** (not Setup). Use `--debug-secure-boot` with one IP to inspect Secure Boot and BIOS state.
 - **BIOS PATCH 400/404:** Attribute names can vary by platform/ROM; use `--fetch-bios-settings` on a working node and apply that file, or try the other built-in profile.
 - **Node skipped / timeout:** Check network and iLO reachability; increase `--timeout` or `--probe-timeout` if needed.
+
+## License
+
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for the full text.
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for how to report issues, suggest changes, and submit pull requests.
