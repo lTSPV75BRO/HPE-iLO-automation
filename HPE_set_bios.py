@@ -15,15 +15,12 @@ Configuration:
 
   Multiple iLOs: pass several IPs (ilo_ip ilo_ip ...) or use -f/--file with one IP per line.
   With multiple targets, reboot is never prompted; use --reboot to reboot all after applying.
+  For HPE nodes in a Nutanix cluster with running workloads, use rolling_restart -h on the CVM to restart nodes safely instead of rebooting via iLO from this script.
   If the Rest API fails for an iLO, the script retries up to 3 times, then skips that node and continues.
   Before each node, a short probe (default 10s timeout) confirms iLO REST is alive; unresponsive nodes are skipped.
 
   BIOS from file: --fetch-bios-settings FILE exports current BIOS + model/CPU from a reference server.
   --bios-settings-file FILE applies that file to targets; --match-model-cpu applies only when model/CPU match.
-
-Sub-NUMA Clustering (SNC): The SubNumaClustering BIOS attribute is set via
-  PATCH to /redfish/v1/Systems/1/Bios/Settings with values Disabled, SNC2, or SNC4.
-  Changes take effect after a server reset (reboot).
 
 Secure Boot: Use --enable-secure-boot to set Secure Boot Enforcement=Enabled and
   Mode=Standard (factory default keys; suitable for AHV). Use --secure-boot-cert <file>
@@ -74,57 +71,134 @@ BIOS_URI = "/redfish/v1/Systems/1/Bios/"
 BIOS_SETTINGS_URI = "/redfish/v1/Systems/1/Bios/Settings/"
 # Trailing slash required by some iLO versions (HPE Redfish examples)
 SYSTEM_RESET_URI = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/"
+BIOS_RESET_TO_DEFAULT_URI = "/redfish/v1/Systems/1/Bios/Actions/Bios.ResetBios/"
 SYSTEM_URI = "/redfish/v1/Systems/1/"
 
-# Sub-NUMA Clustering (SNC): HPE allows Disabled | SNC2 | SNC4. Default is Disabled.
-SUB_NUMA_DISABLED_VALUE = "Disabled"
-# Attributes to always include in PATCH (some iLOs report them incorrectly or they don't stick)
-ALWAYS_APPLY_ATTRIBUTES = {"SubNumaClustering"}
 # Max Rest API retries per iLO before skipping to next node
 MAX_ILO_RETRIES = 3
 # Short timeout (seconds) to probe if iLO REST is alive before full check/set
 PROBE_TIMEOUT = 10
 REDFISH_ROOT_URI = "/redfish/v1/"
 
-# Named Nutanix BIOS profiles (Virtualization-MaxPerformance); use --bios-profile to select by name.
-Nutanix_DL360G11_Intel = {
-    "WorkloadProfile": "Virtualization-MaxPerformance",
-    "PowerRegulator": "StaticHighPerf",
-    "EnergyPerfBias": "MaxPerf",
-    "MinProcIdlePower": "NoCStates",
-    "CollabPowerControl": "Disabled",
-    "NumaGroupSizeOpt": "Clustered",
-    "iSCSISoftwareInitiator": "Disabled",
-    "ProcX2Apic": "ForceEnabled",
-    "IntelUpiPowerManagement": "Disabled",
-    "EnergyEfficientTurbo": "Disabled",
-    "SubNumaClustering": SUB_NUMA_DISABLED_VALUE,
-    "MinProcIdlePkgState": "NoState",
-}
+# Profiles live in bios_profiles/*.txt (no inline dicts). Names = filename without .txt.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BIOS_PROFILES_DIR = os.path.join(SCRIPT_DIR, "bios_profiles")
+DEFAULT_INTEL_PROFILE = "Nutanix_DL360G11_Intel"
+DEFAULT_AMD_PROFILE = "Nutanix_DL385G11_AMD"
 
-Nutanix_DL385G11_AMD = {
-    "WorkloadProfile": "Virtualization-MaxPerformance",
-    "PowerRegulator": "StaticHighPerf",
-    "EnergyPerfBias": "MaxPerf",
-    "MinProcIdlePower": "NoCStates",
-    "CollabPowerControl": "Disabled",
-    "NumaGroupSizeOpt": "Clustered",
-    "iSCSISoftwareInitiator": "Disabled",
-    "ProcX2Apic": "ForceEnabled",
-    "XGMIForceLinkWidth": "x16",
-    "XGMIMaxLinkWidth": "x16",
-    "PerformanceDeterminism": "PerformanceDeterministic",
-}
+# iLO Product Name → Model in hardware_config.json (Foundation). Used for display.
+# First match (longest substring) wins; order more specific first.
+# Gen11: display iLO name as-is (e.g. ProLiant DX360 Gen11 10NVMe); only Gen10/Gen10 Plus mapped below.
+ILO_MODEL_TO_DISPLAY: List[Tuple[str, str]] = [
+    # Gen10 Plus
+    ("ProLiant DX360 Gen10 Plus 10NVMe", "HPE DX360-10 G10 Plus"),
+    ("ProLiant DX360 Gen10 Plus 8SFF", "HPE DX360-8 G10 Plus"),
+    ("ProLiant DX360 Gen10 Plus 4LFF", "HPE DX360-4 G10 Plus"),
+    ("ProLiant DX380 Gen10 Plus 24SFF", "HPE DX380-24 G10 Plus"),
+    ("ProLiant DX380 Gen10 Plus 12LFF", "HPE DX380-12 G10 Plus"),
+    ("ProLiant DX380 Gen10 Plus 8SFF", "HPE DX380-8 G10 Plus"),
+    # Gen10
+    ("ProLiant DX360 Gen10 10NVMe", "HPE DX360-10 G10"),
+    ("ProLiant DX360 Gen10 8SFF", "HPE DX360-8 G10"),
+    ("ProLiant DX360 Gen10 4LFF", "HPE DX360-4 G10"),
+    ("ProLiant DX380 Gen10 24SFF", "HPE DX380-24 G10"),
+    ("ProLiant DX380 Gen10 12LFF", "HPE DX380-12 G10"),
+    ("ProLiant DX380 Gen10 8SFF", "HPE DX380-8 G10"),
+]
 
-# Default Intel/AMD profiles (same as named Nutanix profiles; used when no --bios-profile)
-BIOS_ATTRIBUTES_INTEL = Nutanix_DL360G11_Intel
-BIOS_ATTRIBUTES_AMD = Nutanix_DL385G11_AMD
 
-# Named profiles for --bios-profile (key = CLI name)
-BIOS_PROFILES: Dict[str, Dict[str, str]] = {
-    "Nutanix_DL360G11_Intel": Nutanix_DL360G11_Intel,
-    "Nutanix_DL385G11_AMD": Nutanix_DL385G11_AMD,
-}
+def _model_display_name(ilo_model: str) -> str:
+    """Return hardware_config.json-style model name for display, or ilo_model if no mapping."""
+    if not ilo_model or ilo_model == "Unknown":
+        return ilo_model or "Unknown"
+    for key, display in ILO_MODEL_TO_DISPLAY:
+        if key in ilo_model:
+            return display
+    return ilo_model
+
+
+# iLO Model (substring match) → profile name for auto-selection when no --bios-profile/--bios-settings-file.
+# First match wins; order more specific first. Ensures Gen10 gets Gen10 profile, Gen11/Gen12 get Gen11 profile.
+# Gen12 Intel: Nutanix_Gen12_Intel (PcieMultiSegment=Disabled, WorkloadProfile, BootMode=Uefi required for Foundation/AOS/LCM).
+# Refs: https://www.nutanix.com/products/hardware-platforms/specsheet?platformProvider=HPE
+#       https://portal.nutanix.com/page/documents/details?targetId=HPE-DL-Compute-Server-HW-FW-Compatibility:HPE-DL-Compute-Server-HW-FW-Compatibility
+MODEL_TO_PROFILE: List[Tuple[str, str]] = [
+    # Gen12 (G12) Intel – Nutanix_Gen12_Intel (critical: PcieMultiSegment=Disabled, BootMode=Uefi, WorkloadProfile)
+    ("ProLiant DL380 Gen12 24NVMe", "Nutanix_Gen12_Intel"),
+    ("ProLiant DL380 Gen12", "Nutanix_Gen12_Intel"),
+    ("ProLiant DL360 Gen12", "Nutanix_Gen12_Intel"),
+    ("ProLiant DX380 Gen12", "Nutanix_Gen12_Intel"),
+    ("ProLiant DX360 Gen12", "Nutanix_Gen12_Intel"),
+    # Gen12 AMD – use Gen11 AMD profile until Gen12 AMD–specific profile is added
+    ("ProLiant DL385 Gen12", "Nutanix_DL385G11_AMD"),
+    ("ProLiant DX385 Gen12", "Nutanix_DL385G11_AMD"),
+    # Gen11 – specific first
+    ("ProLiant DX360 Gen11 10NVMe", "Nutanix_Gen11_DX360_10SFF_VMD_Intel"),
+    ("ProLiant DX360 Gen11 8SFF", "Nutanix_Gen11_DX360_8SFF_VMD_Intel"),
+    ("ProLiant DX365 Gen11", "Nutanix_Gen11_DX365_10SFF_VMD_AMD"),
+    ("ProLiant DX360 Gen11", "Nutanix_DL360G11_Intel"),
+    ("ProLiant DX380 Gen11", "Nutanix_DL360G11_Intel"),
+    ("ProLiant DL360 Gen11", "Nutanix_DL360G11_Intel"),
+    ("ProLiant DL385 Gen11", "Nutanix_DL385G11_AMD"),
+    ("ProLiant DX385 Gen11", "Nutanix_DL385G11_AMD"),
+    # Gen10 Plus – Intel
+    ("ProLiant DX360 Gen10 Plus 10NVMe", "Nutanix_Gen10Plus_DX360_10SFF_Intel"),
+    ("ProLiant DX360 Gen10 Plus 8SFF", "Nutanix_Gen10Plus_DX360_8SFF_Intel"),
+    ("ProLiant DX360 Gen10 Plus 4LFF", "Nutanix_Gen10Plus_DX360_8SFF_Intel"),
+    ("ProLiant DX380 Gen10 Plus 24SFF", "Nutanix_Gen10Plus_DX380_24SFF_Intel"),
+    ("ProLiant DX380 Gen10 Plus 12LFF", "Nutanix_Gen10Plus_DX380_12LFF_Intel"),
+    ("ProLiant DX380 Gen10 Plus 8SFF", "Nutanix_Gen10Plus_DX380_8SFF_Intel"),
+    ("ProLiant DX220n Gen10 Plus", "Nutanix_Gen10Plus_DX220n_Intel"),
+    ("ProLiant DX325 Gen10 Plus", "Nutanix_Gen10Plus_DX325_8SFF_Intel"),
+    ("ProLiant e920", "Nutanix_Gen10Plus_EL8000_Intel"),
+    ("ProLiant DX360 Gen10 Plus", "Nutanix_Gen10Plus_DX360_10SFF_Intel"),
+    ("ProLiant DX380 Gen10 Plus", "Nutanix_Gen10Plus_DX380_24SFF_Intel"),
+    # Gen10 Plus – AMD
+    ("ProLiant DX385 Gen10 Plus 24SFF", "Nutanix_Gen10Plus_DX385_24SFF_AMD"),
+    ("ProLiant DX385 Gen10 Plus 12", "Nutanix_Gen10Plus_DX385_12_AMD"),
+    ("ProLiant DX385 Gen10 Plus", "Nutanix_Gen10Plus_DX385_24SFF_AMD"),
+    # Gen10 (non-Plus) – all use Nutanix_Gen10_Intel
+    ("ProLiant DX360 Gen10", "Nutanix_Gen10_Intel"),
+    ("ProLiant DX380 Gen10", "Nutanix_Gen10_Intel"),
+    ("ProLiant DL360 Gen10", "Nutanix_Gen10_Intel"),
+    ("ProLiant DL380 Gen10", "Nutanix_Gen10_Intel"),
+]
+
+
+def _profile_for_model(ilo_model: str, is_amd: bool) -> Optional[str]:
+    """Return profile name for this model (and CPU), or None to use default Gen11 Intel/AMD profile."""
+    if not ilo_model or ilo_model == "Unknown":
+        return None
+    for key, profile_name in MODEL_TO_PROFILE:
+        if key in ilo_model:
+            return profile_name
+    return None
+
+
+def _get_profile_path(profile_name: str) -> str:
+    """Path to profile file (bios_profiles/<name>.txt)."""
+    return os.path.join(BIOS_PROFILES_DIR, profile_name + ".txt")
+
+
+def _list_profile_names() -> List[str]:
+    """Return list of profile names from bios_profiles/*.txt (stem only)."""
+    if not os.path.isdir(BIOS_PROFILES_DIR):
+        return []
+    names = []
+    for f in os.listdir(BIOS_PROFILES_DIR):
+        if f.endswith(".txt") and not f.startswith("."):
+            names.append(f[:-4])
+    return sorted(names)
+
+
+def _load_profile_by_name(profile_name: str) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, str]]]:
+    """Load profile from bios_profiles/<name>.txt. Returns (attrs, metadata) or (None, None) on error."""
+    path = _get_profile_path(profile_name)
+    try:
+        return _load_bios_settings_file(path)
+    except (OSError, FileNotFoundError):
+        return None, None
+
 
 # Secure Boot: Enforcement Enabled, Mode Standard (factory default keys; for AHV/Nutanix).
 # Attribute names may vary by platform (e.g. SecureBootPolicy vs SecureBootMode); check registry if PATCH fails.
@@ -167,7 +241,11 @@ def _is_amd_processor(client: Any) -> bool:
         sys_data = getattr(sys_resp, "dict", None) or getattr(sys_resp, "data", None)
         if not sys_data:
             return False
-        proc_ref = sys_data.get("Processors", {}).get("@odata.id")
+        proc_ref = sys_data.get("Processors")
+        if isinstance(proc_ref, dict):
+            proc_ref = proc_ref.get("@odata.id")
+        elif not isinstance(proc_ref, str):
+            proc_ref = None
         if not proc_ref:
             return False
         proc_resp = client.get(proc_ref)
@@ -175,9 +253,14 @@ def _is_amd_processor(client: Any) -> bool:
             return False
         proc_data = getattr(proc_resp, "dict", None) or getattr(proc_resp, "data", None)
         members = (proc_data or {}).get("Members", [])
+        if not isinstance(members, list):
+            members = []
         for m in members[:2]:  # check first 2 in case of 2P
             try:
-                one = client.get(m["@odata.id"])
+                member_ref = m.get("@odata.id") if isinstance(m, dict) else (m if isinstance(m, str) else None)
+                if not member_ref:
+                    continue
+                one = client.get(member_ref)
                 if one.status != 200:
                     continue
                 one_data = getattr(one, "dict", None) or getattr(one, "data", None)
@@ -192,8 +275,12 @@ def _is_amd_processor(client: Any) -> bool:
 
 
 def _get_desired_attributes(is_amd: bool) -> Dict[str, str]:
-    """Return the desired BIOS attributes for the given processor type."""
-    return dict(BIOS_ATTRIBUTES_AMD if is_amd else BIOS_ATTRIBUTES_INTEL)
+    """Load default profile from bios_profiles/ (Intel or AMD) and return attributes dict."""
+    name = DEFAULT_AMD_PROFILE if is_amd else DEFAULT_INTEL_PROFILE
+    attrs, _ = _load_profile_by_name(name)
+    if not attrs:
+        print(f"Warning: Default profile '{name}' not found in {BIOS_PROFILES_DIR}; no BIOS attributes to apply.", file=sys.stderr)
+    return dict(attrs) if attrs else {}
 
 
 def _get_system_model_cpu(client: Any) -> Tuple[str, str, str]:
@@ -209,7 +296,11 @@ def _get_system_model_cpu(client: Any) -> Tuple[str, str, str]:
         if not sys_data:
             return model, cpu_vendor, cpu_model
         model = (sys_data.get("Model") or "Unknown").strip()
-        proc_ref = sys_data.get("Processors", {}).get("@odata.id")
+        proc_ref = sys_data.get("Processors")
+        if isinstance(proc_ref, dict):
+            proc_ref = proc_ref.get("@odata.id")
+        elif not isinstance(proc_ref, str):
+            proc_ref = None
         if not proc_ref:
             return model, cpu_vendor, cpu_model
         proc_resp = client.get(proc_ref)
@@ -217,9 +308,14 @@ def _get_system_model_cpu(client: Any) -> Tuple[str, str, str]:
             return model, cpu_vendor, cpu_model
         proc_data = getattr(proc_resp, "dict", None) or getattr(proc_resp, "data", None)
         members = (proc_data or {}).get("Members", [])
+        if not isinstance(members, list):
+            members = []
         for m in members[:2]:
             try:
-                one = client.get(m["@odata.id"])
+                member_ref = m.get("@odata.id") if isinstance(m, dict) else (m if isinstance(m, str) else None)
+                if not member_ref:
+                    continue
+                one = client.get(member_ref)
                 if one.status != 200:
                     continue
                 one_data = getattr(one, "dict", None) or getattr(one, "data", None)
@@ -245,7 +341,7 @@ def _load_bios_settings_file(path: str) -> Tuple[Dict[str, str], Dict[str, str]]
     """
     metadata: Dict[str, str] = {}
     attributes: Dict[str, str] = {}
-    with open(path, "r", encoding=FILE_ENCODING) as f:
+    with open(path, "r", encoding=FILE_ENCODING, errors="replace") as f:
         for line in f:
             line = line.rstrip("\n\r")
             s = line.strip()
@@ -324,12 +420,15 @@ def fetch_bios_settings(
 def _load_ips(path: str) -> List[str]:
     """Load IPs from file (one per line); skip empty lines and # comments."""
     ips: List[str] = []
-    with open(path, "r", encoding=FILE_ENCODING) as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            ips.append(line)
+    try:
+        with open(path, "r", encoding=FILE_ENCODING, errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                ips.append(line)
+    except OSError:
+        raise
     return ips
 
 
@@ -670,6 +769,7 @@ def set_bios(
     desired_from_file: Optional[Dict[str, str]] = None,
     file_metadata: Optional[Dict[str, str]] = None,
     match_model_cpu: bool = False,
+    profile_name: Optional[str] = None,
 ) -> Tuple[int, Optional[Any]]:
     """
     Connect to iLO, compare current BIOS with desired, PATCH only differences,
@@ -716,16 +816,33 @@ def set_bios(
             else:
                 desired = dict(desired_from_file)
         else:
-            desired = _get_desired_attributes(is_amd)
+            # No file/profile given: select by model so Gen10 gets Gen10 profile, Gen11 gets Gen11
+            auto_profile = _profile_for_model(model, is_amd)
+            if auto_profile:
+                attrs, _ = _load_profile_by_name(auto_profile)
+                if attrs:
+                    desired = dict(attrs)
+                    profile_name = auto_profile
+                elif not desired:
+                    print(f"Warning: Model-matched profile '{auto_profile}' not found or empty; using default by CPU.", file=sys.stderr)
+            if not desired:
+                desired = _get_desired_attributes(is_amd)
 
         if attribute_overrides:
             desired = {**desired, **attribute_overrides}
 
-        print(f"Model: {model}  CPU: {cpu_vendor} ({cpu_model})")
+        display_profile = profile_name
+        if display_profile is None and desired:
+            display_profile = DEFAULT_AMD_PROFILE if is_amd else DEFAULT_INTEL_PROFILE
+        elif display_profile is None:
+            display_profile = "(none)"
+
+        display_model = _model_display_name(model)
+        print(f"Detected model: {display_model}  CPU: {cpu_vendor} ({cpu_model})")
         if desired:
-            print(f"Using {'file' if desired_from_file is not None else ('AMD' if is_amd else 'Intel')} BIOS profile ({len(desired)} attributes).")
+            print(f"Profile: {display_profile} ({len(desired)} attributes)")
         else:
-            print("No BIOS profile to apply (Secure Boot/cert/reboot only if requested).")
+            print("Profile: (none) – Secure Boot/cert/reboot only if requested")
         print()
 
         # 1. Current BIOS (active) – only if we have desired attributes
@@ -737,11 +854,8 @@ def set_bios(
                 print(f"  {key}: {val}")
             print()
 
-        # 2. Idempotent: only attributes that differ; always include ALWAYS_APPLY_ATTRIBUTES and optional extra keys
+        # 2. Idempotent: only attributes that differ; include optional extra keys (e.g. Secure Boot)
         to_set = _attributes_to_change(desired, current) if desired else {}
-        for key in ALWAYS_APPLY_ATTRIBUTES:
-            if key in desired:
-                to_set[key] = desired[key]
         if always_apply_keys:
             for key in always_apply_keys:
                 if key in desired:
@@ -758,6 +872,7 @@ def set_bios(
             if yes_reboot:
                 _do_reset(client)
             elif prompt_reboot and sys.stdin.isatty():
+                print("For nodes in a Nutanix cluster with workloads, consider: rolling_restart -h (on CVM).")
                 r = input("Reboot server anyway (iLO Reset)? [y/N]: ").strip().lower()
                 if r == "y" or r == "yes":
                     _do_reset(client)
@@ -800,6 +915,7 @@ def set_bios(
             if yes_reboot:
                 _do_reset(client)
             elif sys.stdin.isatty():
+                print("For nodes in a Nutanix cluster with workloads, consider: rolling_restart -h (on CVM).")
                 r = input("Reboot server now (iLO Reset) to apply BIOS changes? [y/N]: ").strip().lower()
                 if r == "y" or r == "yes":
                     _do_reset(client)
@@ -831,6 +947,7 @@ def check_bios(
     extra_desired: Optional[Dict[str, str]] = None,
     cert_pem: Optional[str] = None,
     base_desired: Optional[Dict[str, str]] = None,
+    profile_name: Optional[str] = None,
 ) -> int:
     """
     Connect to iLO, detect CPU type, get current BIOS and desired profile,
@@ -857,10 +974,31 @@ def check_bios(
         client.login()
 
         is_amd = _is_amd_processor(client)
-        desired = dict(base_desired) if base_desired is not None else _get_desired_attributes(is_amd)
+        model, cpu_vendor, cpu_model = _get_system_model_cpu(client)
+        if base_desired is not None:
+            desired = dict(base_desired)
+        else:
+            auto_profile = _profile_for_model(model, is_amd)
+            if auto_profile:
+                attrs, _ = _load_profile_by_name(auto_profile)
+                if attrs:
+                    desired = dict(attrs)
+                else:
+                    print(f"Warning: Model-matched profile '{auto_profile}' not found or empty; using default by CPU.", file=sys.stderr)
+                    desired = _get_desired_attributes(is_amd)
+            else:
+                desired = _get_desired_attributes(is_amd)
         if extra_desired:
             desired = {**desired, **extra_desired}
         current = _get_attributes(client, BIOS_URI)
+
+        display_profile = profile_name
+        if display_profile is None:
+            display_profile = _profile_for_model(model, is_amd) or (DEFAULT_AMD_PROFILE if is_amd else DEFAULT_INTEL_PROFILE)
+        display_model = _model_display_name(model)
+        print(f"Detected model: {display_model}  CPU: {cpu_vendor} ({cpu_model})")
+        print(f"Profile: {display_profile}")
+        print()
 
         # When checking Secure Boot, also GET the SecureBoot resource (actual state, not just BIOS attributes)
         if extra_desired and ("SecureBoot" in extra_desired or "SecureBootEnable" in str(extra_desired)):
@@ -878,9 +1016,9 @@ def check_bios(
                     current["SecureBootEnable"] = "<not reported>"
             except Exception:
                 current["SecureBootEnable"] = "<error reading>"
+            # BIOS GET often does not include SecureBoot string; comparison uses SecureBootEnable from resource only
+            desired.pop("SecureBoot", None)
 
-        print(f"Processor: {'AMD' if is_amd else 'Intel'} – comparing against {'AMD' if is_amd else 'Intel'} profile.")
-        print()
         print(f"{'Attribute':<35} {'Current':<28} {'Desired':<28} {'Match'}")
         print("-" * 95)
 
@@ -889,6 +1027,10 @@ def check_bios(
             cur = current.get(key)
             cur_str = str(cur) if cur is not None else "<not set>"
             want = desired[key]
+            # VMD port keys: if iLO does not report the attribute (port not present on platform), treat as N/A not DIFF
+            if key.startswith("Vmdon") and cur is None:
+                print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28} {'N/A'}")
+                continue
             match = cur is not None and str(cur).strip() == str(want).strip()
             if not match:
                 all_match = False
@@ -941,6 +1083,30 @@ def _do_reset(client: Any) -> None:
         print(f"Reset failed: {e}", file=sys.stderr)
 
 
+def _reset_bios_to_default(client: Any) -> bool:
+    """POST Bios.ResetBios to restore BIOS settings to factory default. Returns True on success. Reboot required for changes to take effect."""
+    uris_to_try = [
+        BIOS_RESET_TO_DEFAULT_URI,
+        "/redfish/v1/Systems/1/Bios/Actions/Bios.ResetBios",
+        "/redfish/v1/systems/1/bios/Actions/Bios.ResetBios/",
+    ]
+    body = {}
+    last_err = None
+    for uri in uris_to_try:
+        try:
+            resp = client.post(uri, body)
+            if resp.status in (200, 204, 202):
+                print("BIOS reset to default requested successfully. Reboot the server for changes to take effect.")
+                return True
+            last_err = f"status {resp.status}"
+            if hasattr(resp, "text") and resp.text:
+                last_err += f" {resp.text[:300]}"
+        except Exception as e:
+            last_err = str(e)
+    print(f"BIOS reset to default failed: {last_err}", file=sys.stderr)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Set HPE node BIOS via iLO Redfish (production-ready, idempotent). BIOS is optional: use built-in profile, --bios-settings-file, or --no-bios.",
@@ -960,7 +1126,7 @@ def main() -> int:
         metavar="PATH",
         help=f"File with one iLO IP per line; -f alone uses {DEFAULT_INPUT_FILE}",
     )
-    parser.add_argument("-u", "--user", default=DEFAULT_USERNAME, help=f"iLO user (default: {DEFAULT_USERNAME})")
+    parser.add_argument("-u", "--user", "--username", dest="user", default=DEFAULT_USERNAME, metavar="USER", help=f"iLO username (default: {DEFAULT_USERNAME})")
     parser.add_argument("-p", "--password", default=DEFAULT_PASSWORD, help="iLO password (default: ILO_PASSWORD env)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds for API calls (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--probe-timeout", type=int, default=PROBE_TIMEOUT, metavar="SEC", help=f"Timeout for iLO alive probe in seconds (default: {PROBE_TIMEOUT})")
@@ -970,10 +1136,9 @@ def main() -> int:
     parser.add_argument("--no-reboot-prompt", action="store_true", help="Do not ask to reboot server after applying settings")
     parser.add_argument("--reboot", action="store_true", help="Reboot server after applying settings (no prompt)")
     parser.add_argument(
-        "--subnuma-value",
-        choices=("Disabled", "SNC2", "SNC4"),
-        default=None,
-        help="SubNumaClustering value (default: Disabled). Options: Disabled, SNC2, SNC4.",
+        "--reset-bios-to-default",
+        action="store_true",
+        help="Reset BIOS settings to factory default (no profile apply). Use --reboot to reboot after reset. Reboot required for changes to take effect.",
     )
     sb_group = parser.add_mutually_exclusive_group()
     sb_group.add_argument(
@@ -1014,12 +1179,13 @@ def main() -> int:
         action="store_true",
         help="Do not apply any BIOS profile (only Secure Boot, cert, reboot if requested).",
     )
+    _profile_choices = _list_profile_names()
     parser.add_argument(
         "--bios-profile",
-        choices=list(BIOS_PROFILES.keys()),
+        choices=_profile_choices if _profile_choices else None,
         default=None,
         metavar="NAME",
-        help="Use named BIOS profile: Nutanix_DL360G11_Intel, Nutanix_DL385G11_AMD (default: auto-detect by CPU).",
+        help="Use named profile from bios_profiles/ (e.g. Nutanix_DL360G11_Intel). Default: auto-detect by model.",
     )
     parser.add_argument(
         "--match-model-cpu",
@@ -1027,6 +1193,51 @@ def main() -> int:
         help="When using --bios-settings-file: only apply if server model and CPU match the file header.",
     )
     args = parser.parse_args()
+
+    # --dry-run: show what would be applied; no targets or password required
+    if args.dry_run:
+        if args.bios_settings_file:
+            try:
+                attrs, meta = _load_bios_settings_file(args.bios_settings_file)
+                print(f"Dry run – BIOS from file: {args.bios_settings_file}")
+                if meta:
+                    print("  Metadata:", meta)
+                for k, v in sorted(attrs.items()):
+                    print(f"  {k}: {v}")
+            except FileNotFoundError:
+                print(f"Error: File not found: {args.bios_settings_file}", file=sys.stderr)
+                return 2
+            except OSError as e:
+                print(f"Error reading {args.bios_settings_file}: {e}", file=sys.stderr)
+                return 2
+        elif args.bios_profile:
+            attrs, _ = _load_profile_by_name(args.bios_profile)
+            if attrs:
+                print(f"Dry run – named profile: {args.bios_profile}")
+                for k, v in sorted(attrs.items()):
+                    print(f"  {k}: {v}")
+            else:
+                print(f"Dry run – profile {args.bios_profile} not found in {BIOS_PROFILES_DIR}", file=sys.stderr)
+                return 2
+        elif args.no_bios:
+            print("Dry run – no BIOS profile (--no-bios); Secure Boot/cert/reboot only if requested.")
+        else:
+            print(f"Dry run – default profile by CPU ({DEFAULT_INTEL_PROFILE} / {DEFAULT_AMD_PROFILE}).")
+            for label, name in [("Intel", DEFAULT_INTEL_PROFILE), ("AMD", DEFAULT_AMD_PROFILE)]:
+                attrs, _ = _load_profile_by_name(name)
+                if attrs:
+                    print(f"\n{label} profile ({name}):")
+                    for k, v in sorted(attrs.items()):
+                        print(f"  {k}: {v}")
+                else:
+                    print(f"\n{label} profile {name}: (file not found)", file=sys.stderr)
+        if args.enable_secure_boot:
+            print("\nSecure Boot (with --enable-secure-boot):")
+            for k, v in SECURE_BOOT_ATTRIBUTES.items():
+                print(f"  {k}: {v}")
+        if args.disable_secure_boot:
+            print("\nSecure Boot: disabled (--disable-secure-boot)")
+        return 0
 
     # Resolve target list: -f/--file or positional IPs
     if args.file:
@@ -1083,6 +1294,48 @@ def main() -> int:
             print(f"  {ip}: {msg}", file=sys.stderr)
         print("Error: Could not fetch BIOS from any target.", file=sys.stderr)
         return 1
+
+    if args.reset_bios_to_default:
+        if not args.password:
+            print("Error: Password required for --reset-bios-to-default. Set ILO_PASSWORD or use -p.", file=sys.stderr)
+            return 2
+        print("Note: For nodes in a Nutanix cluster with running workloads, use rolling_restart -h on the CVM to restart nodes safely.")
+        any_fail = 0
+        for i, ip in enumerate(targets, 1):
+            if multi:
+                print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
+            if not probe_ilo_alive(ip, args.user, args.password, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+                print(f"iLO at {ip} not responding, skipping.", file=sys.stderr)
+                any_fail = 1
+                continue
+            client = None
+            try:
+                kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": args.password, "timeout": args.timeout}
+                if not args.no_verify_ssl:
+                    pass
+                else:
+                    kwargs["default_verify_cert"] = False
+                try:
+                    client = RedfishClient(**kwargs)
+                except TypeError:
+                    kwargs.pop("default_verify_cert", None)
+                    client = RedfishClient(**kwargs)
+                client.login()
+                if _reset_bios_to_default(client):
+                    if args.reboot:
+                        _do_reset(client)
+                else:
+                    any_fail = 1
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                any_fail = 1
+            finally:
+                if client is not None:
+                    try:
+                        client.logout()
+                    except Exception:
+                        pass
+        return any_fail
 
     if args.debug_secure_boot:
         if not args.password:
@@ -1156,44 +1409,11 @@ def main() -> int:
                 extra_desired=extra,
                 cert_pem=check_cert_pem,
                 base_desired=check_base,
+                profile_name=args.bios_profile or args.bios_settings_file,
             )
             if code != 0:
                 any_fail = 1
         return any_fail
-
-    if args.dry_run:
-        if args.bios_settings_file:
-            try:
-                attrs, meta = _load_bios_settings_file(args.bios_settings_file)
-                print(f"Dry run – BIOS from file: {args.bios_settings_file}")
-                if meta:
-                    print("  Metadata:", meta)
-                for k, v in sorted(attrs.items()):
-                    print(f"  {k}: {v}")
-            except Exception as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 2
-        elif args.bios_profile:
-            print(f"Dry run – named profile: {args.bios_profile}")
-            for k, v in sorted(BIOS_PROFILES[args.bios_profile].items()):
-                print(f"  {k}: {v}")
-        elif args.no_bios:
-            print("Dry run – no BIOS profile (--no-bios); Secure Boot/cert/reboot only if requested.")
-        else:
-            print("Dry run – built-in profile by CPU (Nutanix_DL360G11_Intel / Nutanix_DL385G11_AMD).")
-            print("\nIntel profile:")
-            for k, v in BIOS_ATTRIBUTES_INTEL.items():
-                print(f"  {k}: {v}")
-            print("\nAMD profile (additional/different):")
-            for k, v in BIOS_ATTRIBUTES_AMD.items():
-                print(f"  {k}: {v}")
-        if args.enable_secure_boot:
-            print("\nSecure Boot (with --enable-secure-boot):")
-            for k, v in SECURE_BOOT_ATTRIBUTES.items():
-                print(f"  {k}: {v}")
-        if args.disable_secure_boot:
-            print("\nSecure Boot: disabled (--disable-secure-boot)")
-        return 0
 
     if not args.password:
         print("Error: iLO password required. Set ILO_PASSWORD or use -p.", file=sys.stderr)
@@ -1215,14 +1435,16 @@ def main() -> int:
             print(f"Error reading {args.bios_settings_file}: {e}", file=sys.stderr)
             return 2
     elif args.bios_profile:
-        desired_from_file = dict(BIOS_PROFILES[args.bios_profile])
-        file_metadata = None
+        attrs, meta = _load_profile_by_name(args.bios_profile)
+        if not attrs:
+            print(f"Error: Profile '{args.bios_profile}' not found in {BIOS_PROFILES_DIR}.", file=sys.stderr)
+            return 2
+        desired_from_file = attrs
+        file_metadata = meta
     elif args.no_bios:
         desired_from_file = {}
 
     overrides = {}
-    if args.subnuma_value is not None:
-        overrides["SubNumaClustering"] = args.subnuma_value
     if args.enable_secure_boot:
         overrides.update(SECURE_BOOT_ATTRIBUTES)
     if args.disable_secure_boot:
@@ -1270,6 +1492,7 @@ def main() -> int:
                 desired_from_file=desired_from_file,
                 file_metadata=file_metadata,
                 match_model_cpu=args.match_model_cpu,
+                profile_name=args.bios_profile or args.bios_settings_file,
             )
             if code == 0:
                 break

@@ -48,17 +48,72 @@ Use `-u` / `-p` on the command line to override. Prefer env vars in production t
 
 ## BIOS profiles
 
-Built-in Nutanix profiles (Virtualization-MaxPerformance):
+Nutanix-recommended profiles are built in; use `--bios-profile NAME` or `--bios-settings-file bios_profiles/NAME.txt`.
 
-- **Nutanix_DL360G11_Intel** – HPE ProLiant DL360 Gen11 (Intel Xeon)
-- **Nutanix_DL385G11_AMD** – HPE ProLiant DL385 Gen11 (AMD EPYC)
+**HPE DX/DL Gen10**
 
-The same profiles are available as text files in `bios_profiles/` for `--bios-settings-file` and `--match-model-cpu`:
+| Profile | Platform |
+|---------|----------|
+| `Nutanix_Gen10_Intel` | All HPE Gen10 systems (Intel): Custom workload, OsControl, SR-IOV/VT-d/APIC |
 
-- `bios_profiles/Nutanix_DL360G11_Intel.txt`
-- `bios_profiles/Nutanix_DL385G11_AMD.txt`
+**HPE Gen10 Plus**
 
-File format: `# Model=...`, `# CPU=...`, `# CPU_Model=...` header, then `key=value` per line.
+| Profile | Platform |
+|---------|----------|
+| `Nutanix_Gen10Plus_DX360_10SFF_Intel` | DX360-10SFF ALL NVMe (Intel) |
+| `Nutanix_Gen10Plus_DX360_10SFF_VMD_Intel` | DX360-10SFF VMD NVMe (Intel) |
+| `Nutanix_Gen10Plus_DX360_8SFF_Intel` | DX360-8SFF (8+2 NVMe) |
+| `Nutanix_Gen10Plus_DX360_8SFF_VMD_Intel` | DX360-8SFF VMD NVMe |
+| `Nutanix_Gen10Plus_DX385_24SFF_AMD` | DX385-24SFF (AMD) |
+| `Nutanix_Gen10Plus_DX325_8SFF_Intel` | DX325-8SFF |
+| `Nutanix_Gen10Plus_DX220n_Intel` | ProLiant DX220n |
+| `Nutanix_Gen10Plus_DX380_24SFF_Intel` | DX380-24SFF |
+| `Nutanix_Gen10Plus_DX380_12LFF_Intel` | DX380-12LFF |
+| `Nutanix_Gen10Plus_DX380_8SFF_Intel` | DX380-8SFF |
+| `Nutanix_Gen10Plus_DX385_12_AMD` | DX385-12 (AMD) |
+| `Nutanix_Gen10Plus_EL8000_Intel` | ProLiant e920 (Edgeline EL8000) |
+
+**HPE Gen11 (DL/DX)**
+
+| Profile | Platform |
+|---------|----------|
+| `Nutanix_DL360G11_Intel` | All Gen11 Intel (e.g. DL360 Gen11) |
+| `Nutanix_DL385G11_AMD` | All Gen11 AMD (e.g. DL385 Gen11) |
+| `Nutanix_Gen11_DX360_10SFF_VMD_Intel` | DX360-10SFF NVMe VMD |
+| `Nutanix_Gen11_DX360_8SFF_VMD_Intel` | DX360-8SFF+2 NVMe VMD |
+| `Nutanix_Gen11_DX365_10SFF_VMD_AMD` | DX365-10SFF ALL NVMe VMD (AMD) |
+
+**HPE Gen12 (DL/DX) – Nutanix required settings**
+
+| Profile | Platform |
+|---------|----------|
+| `Nutanix_Gen12_Intel` | DL360 Gen12, DL380 Gen12 (Intel). **Critical:** PCIe Multi-Segment=Disabled (required for Foundation 5.10+ and AOS 7.5+), Workload Profile=Virtualization-MaxPerformance, Boot Mode=UEFI. Use `--enable-secure-boot` and `--secure-boot-cert` when Secure Boot is required. |
+
+All of the above are also available as `bios_profiles/<NAME>.txt` for `--bios-settings-file` and `--match-model-cpu`. File format: `# Model=...`, `# CPU=...`, `# CPU_Model=...` header, then `key=value` per line.
+
+**Auto-selection by model:** When you do not pass `--bios-profile` or `--bios-settings-file`, the script picks a profile from the detected iLO **model**. Gen10 nodes get a Gen10 profile; Gen11 nodes get a Gen11 profile; Gen12 Intel (DL360/DL380/DX360/DX380) get `Nutanix_Gen12_Intel` with the required PCIe Multi-Segment, Boot Mode, and Workload Profile settings. So a generic Gen10 node will not receive Gen11/Gen12 settings.
+
+**HPE supported hardware:** For the official list of Nutanix-supported HPE platforms and compatibility, see [Nutanix Hardware Platforms – HPE](https://www.nutanix.com/products/hardware-platforms/specsheet?platformProvider=HPE) and [HPE DL Compute Server HW/FW Compatibility](https://portal.nutanix.com/page/documents/details?targetId=HPE-DL-Compute-Server-HW-FW-Compatibility:HPE-DL-Compute-Server-HW-FW-Compatibility).
+
+**Product name / model mapping (Foundation):** Product Name in iLO and Model in `hardware_config.json` are set by Nutanix Foundation during imaging. If a node is reset to default settings, that mapping can be lost. Profile files use `# Model=` set to the iLO Product Name where applicable so `--match-model-cpu` applies the correct profile. Reference mapping (iLO Product Name → hardware_config.json Model):
+
+| Product Name in iLO | Model in hardware_config.json |
+|--------------------|-------------------------------|
+| ProLiant DX360 Gen10 4LFF | HPE DX360-4 G10 |
+| ProLiant DX360 Gen10 8SFF | HPE DX360-8 G10 |
+| ProLiant DX360 Gen10 10NVMe | HPE DX360-10 G10 |
+| ProLiant DX380 Gen10 8SFF | HPE DX380-8 G10 |
+| ProLiant DX380 Gen10 12LFF | HPE DX380-12 G10 |
+| ProLiant DX380 Gen10 24SFF | HPE DX380-24 G10 |
+| ProLiant DX360 Gen10 Plus 4LFF | HPE DX360-4 G10 Plus |
+| ProLiant DX360 Gen10 Plus 8SFF | HPE DX360-8 G10 Plus |
+| ProLiant DX380 Gen10 Plus 8SFF | HPE DX380-8 G10 Plus |
+| ProLiant DX360 Gen10 Plus 10NVMe | HPE DX360-10 G10 Plus |
+| ProLiant DX380 Gen10 Plus 12LFF | HPE DX380-12 G10 Plus |
+| ProLiant DX380 Gen10 Plus 24SFF | HPE DX380-24 G10 Plus |
+| (+ FSC variants: 4LFF/8SFF/12LFF/24SFF) | HPE DX... G10 Plus FSC |
+
+Gen11 systems (e.g. ProLiant DX360 Gen11 10NVMe) are shown by the script using the iLO product name as reported.
 
 ## Quick start
 
@@ -95,6 +150,13 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --no-bios \
   --enable-secure-boot --secure-boot-cert Nutanix_Secure_Boot_v3.cer --reboot
 ```
 
+**Reset BIOS to factory default (then reboot if desired):**
+```bash
+python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--reboot]
+```
+
+**Note:** For nodes in a Nutanix cluster with workloads, use **`rolling_restart -h`** on the CVM to restart nodes safely instead of rebooting via iLO from this script.
+
 ## HPE_set_bios.py options
 
 | Option | Description |
@@ -113,8 +175,11 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --no-bios \
 | `--secure-boot-cert FILE` | Import certificate into Secure Boot db (e.g. Nutanix .cer); BIOS in User mode required |
 | `--reboot` | Reboot server(s) after applying (no prompt) |
 | `--no-reboot-prompt` | Do not ask to reboot |
+| `--reset-bios-to-default` | Reset BIOS to factory default (no profile apply). Use with `--reboot` to reboot after reset. |
 | `--no-verify-ssl` | Disable SSL verification (lab only) |
 | `--version` | Print script version and exit |
+
+**Rebooting nodes in a cluster:** For HPE nodes that are in a Nutanix cluster with running workloads, do **not** reboot them directly via this script’s prompt or `--reboot` for the whole list. Use **`rolling_restart -h`** on a CVM to restart nodes safely (one at a time, with workload migration). Example on CVM: `rolling_restart -h` for usage.
 
 ## HPEilodetials.py options
 

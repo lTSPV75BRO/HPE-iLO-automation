@@ -1,5 +1,5 @@
-# Nutanix recommended BIOS profile: All Gen11 HPE DX/DL AMD (e.g. DL385 Gen11).
-# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_DL385G11_AMD.txt [--match-model-cpu]
+# Nutanix recommended BIOS profile: Gen11 DX365-10SFF ALL NVMe VMD (AMD).
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen11_DX365_10SFF_VMD_AMD.txt --match-model-cpu
 # Model=
 # CPU=AMD
 # CPU_Model=AMD EPYC
@@ -8,6 +8,7 @@ CollabPowerControl=Disabled
 EnergyPerfBias=MaxPerf
 MinProcIdlePower=NoCStates
 NumaGroupSizeOpt=Clustered
+PciResourcePadding=Enabled
 PerformanceDeterminism=PerformanceDeterministic
 PowerRegulator=StaticHighPerf
 ProcX2Apic=ForceEnabled
