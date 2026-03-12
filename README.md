@@ -1,6 +1,6 @@
 # HPE iLO automation scripts
 
-Production-ready Python scripts for HPE iLO Redfish: inventory collection and BIOS configuration (including Nutanix-oriented profiles and Secure Boot).
+Python scripts for HPE iLO Redfish: inventory collection and BIOS configuration (including Nutanix-oriented profiles and Secure Boot).
 
 ## Scripts
 
@@ -69,14 +69,4 @@ python HPEilodetials.py -f ips.txt -p 'your_password' --fetch-bios-settings ./bi
 ```bash
 python HPE_set_bios.py -f ips.txt -p 'your_password' --no-bios \
   --enable-secure-boot --secure-boot-cert Nutanix_Secure_Boot_v3.cer --reboot
-```
-
-## Git
-
-This directory is set up as a Git repository. Do not commit passwords or `ips.txt` if it contains sensitive IPs; use `.gitignore` and env vars for secrets.
-
-```bash
-git init
-git add HPE_set_bios.py HPEilodetials.py requirements.txt README.md .gitignore bios_profiles/
-git commit -m "Add HPE iLO BIOS and inventory scripts with Nutanix profiles"
 ```
