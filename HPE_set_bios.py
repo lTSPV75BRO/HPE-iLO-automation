@@ -50,6 +50,8 @@ if sys.version_info < (3, 6):
     print("Error: This script requires Python 3.6 or later.", file=sys.stderr)
     sys.exit(2)
 
+__version__ = "1.0.0"
+
 try:
     from redfish import RedfishClient
 except ImportError:
@@ -944,6 +946,7 @@ def main() -> int:
         description="Set HPE node BIOS via iLO Redfish (production-ready, idempotent). BIOS is optional: use built-in profile, --bios-settings-file, or --no-bios.",
         epilog="Use --fetch-bios-settings to export from a reference server; then --bios-settings-file + --match-model-cpu to apply to same model/CPU.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "ilo_ip",
         nargs="*",
