@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpe-set-bios"
+version = "1.0.0"
+description = "Set HPE node BIOS via iLO Redfish API (Nutanix-compatible profiles, Secure Boot, multi-iLO)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.6"
+authors = []
+keywords = ["hpe", "ilo", "redfish", "bios", "nutanix"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "python-ilorest-library>=3.0.0",
+]
+
+[project.scripts]
+hpe-set-bios = "hpe_set_bios.cli:main"
+
+[project.optional-dependencies]
+dev = ["build>=0.10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hpe_set_bios*"]
+
+[tool.setuptools.package-data]
+hpe_set_bios = ["bios_profiles/*.txt"]
