@@ -1,0 +1,30 @@
+# Nutanix required BIOS profile: HPE ProLiant Gen12 Intel (DL360 Gen12, DL380 Gen12).
+# Mandatory for AOS, Foundation 5.10+, and LCM on "Third-party" or "Software-only" deployments.
+# Appliance (Compute for Nutanix) models are pre-configured; use this for validation or manual setup.
+#
+# Critical required settings:
+#   - PCIe Multi-Segment: Disabled (if enabled, Foundation 5.10+ reimaging fails; AOS 7.5+ upgrades can break).
+#   - Workload Profile: Virtualization-MaxPerformance (hypervisor power management).
+#   - Boot Mode: UEFI (Legacy BIOS not supported on Gen12).
+#   - Secure Boot: use --enable-secure-boot and --secure-boot-cert when required.
+#
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen12_Intel.txt [--match-model-cpu]
+# Model=
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+BootMode=Uefi
+CollabPowerControl=Disabled
+EnergyEfficientTurbo=Disabled
+EnergyPerfBias=MaxPerf
+IntelUpiPowerManagement=Disabled
+MinProcIdlePkgState=NoState
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PcieMultiSegment=Disabled
+PCIeMultiSegment=Disabled
+PowerRegulator=StaticHighPerf
+ProcX2Apic=ForceEnabled
+SubNumaClustering=Disabled
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled

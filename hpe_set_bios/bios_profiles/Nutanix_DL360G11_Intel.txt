@@ -1,0 +1,18 @@
+# Nutanix recommended BIOS profile: All Gen11 HPE DX/DL Intel (e.g. DL360 Gen11).
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_DL360G11_Intel.txt [--match-model-cpu]
+# Model=
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+CollabPowerControl=Disabled
+EnergyEfficientTurbo=Disabled
+EnergyPerfBias=MaxPerf
+IntelUpiPowerManagement=Disabled
+MinProcIdlePkgState=NoState
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=ForceEnabled
+SubNumaClustering=Disabled
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled

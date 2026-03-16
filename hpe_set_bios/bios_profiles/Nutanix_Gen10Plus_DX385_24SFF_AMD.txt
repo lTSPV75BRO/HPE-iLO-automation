@@ -1,0 +1,16 @@
+# Nutanix recommended BIOS profile: DX385-24SFF G10 Plus (AMD).
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen10Plus_DX385_24SFF_AMD.txt --match-model-cpu
+# Model=ProLiant DX385 Gen10 Plus 24SFF
+# CPU=AMD
+# CPU_Model=AMD EPYC
+
+CollabPowerControl=Disabled
+EnergyPerfBias=MaxPerf
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=Enabled
+WorkloadProfile=Virtualization-MaxPerformance
+XGMIForceLinkWidth=x16
+XGMIMaxLinkWidth=x16
+iSCSISoftwareInitiator=Disabled

@@ -1,0 +1,22 @@
+# Nutanix recommended BIOS profile: Gen11 DX360-8SFF+2 NVMe VMD (Intel).
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen11_DX360_8SFF_VMD_Intel.txt --match-model-cpu
+# Model=
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+CollabPowerControl=Disabled
+EnergyEfficientTurbo=Disabled
+EnergyPerfBias=MaxPerf
+IntelUpiPowerManagement=Disabled
+IntelVmdDirectAssign=VmdDirectAssignEnabledAll
+IntelVmdSupport=IntelVmdEnabledIndividual
+MinProcIdlePkgState=NoState
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=ForceEnabled
+SubNumaClustering=Disabled
+VmdonCpu1Stack5Port1=Enabled
+VmdonCpu1Stack5Port3=Enabled
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled

@@ -1,0 +1,14 @@
+# Nutanix recommended BIOS profile: DX325-8SFF G10 Plus.
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen10Plus_DX325_8SFF_Intel.txt --match-model-cpu
+# Model=
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+CollabPowerControl=Disabled
+EnergyPerfBias=MaxPerf
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=Enabled
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled

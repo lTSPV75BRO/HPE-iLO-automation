@@ -1,0 +1,12 @@
+# Nutanix recommended BIOS profile: ProLiant e920 (Edgeline EL8000).
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen10Plus_EL8000_Intel.txt --match-model-cpu
+# Model=ProLiant e920
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+IntelProcVtd=Enabled
+Processorx2APICSupport=Enabled
+ProcVirtualization=Enabled
+ProcX2Apic=Enabled
+Sriov=Enabled
+WorkloadProfile=Virtualization-MaxPerformance

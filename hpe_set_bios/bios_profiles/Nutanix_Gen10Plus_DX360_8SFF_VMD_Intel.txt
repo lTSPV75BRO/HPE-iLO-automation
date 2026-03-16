@@ -1,0 +1,28 @@
+# Nutanix recommended BIOS profile: DX360-8SFF G10 Plus VMD NVMe (8+2 NVMe).
+# Product Name in ILO: ProLiant DX360 Gen10 Plus 8SFF | hardware_config.json: HPE DX360-8 G10 Plus.
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen10Plus_DX360_8SFF_VMD_Intel.txt --match-model-cpu
+# Model=ProLiant DX360 Gen10 Plus 8SFF
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+CollabPowerControl=Disabled
+EmbeddedSata=Ahci
+EnergyEfficientTurbo=Disabled
+EnergyPerfBias=MaxPerf
+IntelUpiPowerManagement=Disabled
+IntelVmdDirectAssign=VmdDirectAssignEnabledAll
+IntelVmdSupport=IntelVmdEnabledIndividual
+MinProcIdlePkgState=NoState
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=Enabled
+SubNumaClustering=Disabled
+UncoreFreqScaling=Maximum
+VmdonCpu1Stack2Port1=Disabled
+VmdonCpu1Stack5Port1=Disabled
+VmdonCpu1Stack5Port2=Disabled
+VmdonCpu1Stack5Port3=Enabled
+VmdonCpu1Stack5Port4=Enabled
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled

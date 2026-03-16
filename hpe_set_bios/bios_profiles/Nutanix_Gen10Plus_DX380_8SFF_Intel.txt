@@ -1,0 +1,22 @@
+# Nutanix recommended BIOS profile: DX380-8SFF G10 Plus.
+# Product Name in ILO: ProLiant DX380 Gen10 Plus 8SFF | hardware_config.json: HPE DX380-8 G10 Plus.
+# Use with: HPE_set_bios.py --bios-settings-file bios_profiles/Nutanix_Gen10Plus_DX380_8SFF_Intel.txt --match-model-cpu
+# Model=ProLiant DX380 Gen10 Plus 8SFF
+# CPU=Intel
+# CPU_Model=Intel Xeon
+
+CollabPowerControl=Disabled
+EmbeddedSata=Ahci
+EnergyEfficientTurbo=Disabled
+EnergyPerfBias=MaxPerf
+IntelUpiPowerManagement=Disabled
+IntelVmdSupport=Disabled
+MinProcIdlePkgState=NoState
+MinProcIdlePower=NoCStates
+NumaGroupSizeOpt=Clustered
+PowerRegulator=StaticHighPerf
+ProcX2Apic=Enabled
+SubNumaClustering=Disabled
+UncoreFreqScaling=Maximum
+WorkloadProfile=Virtualization-MaxPerformance
+iSCSISoftwareInitiator=Disabled
