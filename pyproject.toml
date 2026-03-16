@@ -7,7 +7,7 @@ name = "hpe-set-bios"
 version = "1.0.0"
 description = "Set HPE node BIOS via iLO Redfish API (Nutanix-compatible profiles, Secure Boot, multi-iLO)."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.6"
 authors = []
 keywords = ["hpe", "ilo", "redfish", "bios", "nutanix"]
@@ -15,7 +15,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.6",
@@ -40,6 +39,3 @@ dev = ["build>=0.10"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hpe_set_bios*"]
-
-[tool.setuptools.package-data]
-hpe_set_bios = ["bios_profiles/*.txt"]

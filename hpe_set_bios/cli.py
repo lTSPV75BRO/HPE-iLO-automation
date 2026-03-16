@@ -85,9 +85,15 @@ MAX_ILO_RETRIES = 3
 PROBE_TIMEOUT = 10
 REDFISH_ROOT_URI = "/redfish/v1/"
 
-# Profiles live in bios_profiles/*.txt (no inline dicts). Names = filename without .txt.
+# Profiles: prefer repo root bios_profiles/, then package dir, then cwd.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BIOS_PROFILES_DIR = os.path.join(SCRIPT_DIR, "bios_profiles")
+_PARENT_DIR = os.path.dirname(SCRIPT_DIR)
+_CANDIDATES = [
+    os.path.join(_PARENT_DIR, "bios_profiles"),
+    os.path.join(SCRIPT_DIR, "bios_profiles"),
+    os.path.join(os.getcwd(), "bios_profiles"),
+]
+BIOS_PROFILES_DIR = next((p for p in _CANDIDATES if os.path.isdir(p)), _CANDIDATES[1])
 DEFAULT_INTEL_PROFILE = "Nutanix_DL360G11_Intel"
 DEFAULT_AMD_PROFILE = "Nutanix_DL385G11_AMD"
 

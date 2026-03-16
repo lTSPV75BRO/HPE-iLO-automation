@@ -19,6 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+hpe_set_bios/bios_profiles/
 
 # Virtual environments
 venv/
