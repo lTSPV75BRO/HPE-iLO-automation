@@ -1151,6 +1151,7 @@ def _reset_bios_to_default(client: Any) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
+        prog="hpe-set-bios",
         description="Set HPE node BIOS via iLO Redfish (production-ready, idempotent). BIOS is optional: use built-in profile, --bios-settings-file, or --no-bios.",
         epilog="Use --fetch-bios-settings to export from a reference server; then --bios-settings-file + --match-model-cpu to apply to same model/CPU.",
     )
