@@ -14,7 +14,6 @@ Production-ready Python scripts for HPE iLO Redfish: inventory collection and BI
 - [Secure Boot and certificates](#secure-boot-and-certificates)
 - [Exit codes](#exit-codes)
 - [Repository structure](#repository-structure)
-- [Packaging](#packaging)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 - [Contributing](#contributing)
@@ -40,24 +39,19 @@ pip install -r requirements.txt
 python HPE_set_bios.py -f ips.txt -p 'password' --check
 ```
 
-**As a package (recommended for reuse):**
+**As a package (from repo root):**
 ```bash
-pip install .   # from repo root
-hpe-set-bios -f ips.txt -p 'password' --check
+pip install .
+python3 -m hpe_set_bios -f ips.txt -p 'password' --check
 ```
 
-Or install in editable mode while developing:
+**Install from GitHub:**
 ```bash
-pip install -e .
+pip install "git+https://github.com/lTSPV75BRO/HPE-iLO-automation.git"
+python3 -m hpe_set_bios -f ips.txt -p 'password' --check
 ```
-The `hpe-set-bios` command and built-in BIOS profiles are installed; use `hpe-set-bios` the same way as `python HPE_set_bios.py`.
 
-**Build wheel/source for distribution:** See [PACKAGING.md](PACKAGING.md) for step-by-step instructions.
-```bash
-pip install build && python3 -m build
-# → dist/hpe_set_bios-1.0.0-py3-none-any.whl
-# Install: pip install dist/hpe_set_bios-1.0.0-py3-none-any.whl
-```
+Run from the repo root so that `bios_profiles/` (at repo root) is found. When installed via pip, run from a directory that contains `bios_profiles/` or clone the repo.
 
 ## Configuration
 
@@ -239,35 +233,19 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 
 ```
 .
-├── HPE_set_bios.py          # Launcher (run from repo); use 'hpe-set-bios' when installed
+├── HPE_set_bios.py          # Launcher (run from repo)
 ├── HPEilodetials.py         # Inventory collection
-├── pyproject.toml           # Package config (pip install .)
-├── requirements.txt         # Python dependencies
+├── bios_profiles/           # Nutanix BIOS profiles (*.txt)
+├── hpe_set_bios/            # Package (cli, __init__, __main__)
+├── pyproject.toml
+├── requirements.txt
 ├── README.md
 ├── LICENSE
 ├── CONTRIBUTING.md
-├── ips.txt.example
-├── bios_profiles/           # Used when running from repo
-│   └── *.txt                # Nutanix BIOS profiles
-└── hpe_set_bios/            # Installable package
-    ├── __init__.py
-    ├── __main__.py          # python -m hpe_set_bios
-    ├── cli.py               # Main script logic
-    └── bios_profiles/       # Shipped with package
-        └── *.txt
+└── ips.txt.example
 ```
 
-Do not commit `ips.txt` (real IPs) or passwords; use environment variables or secure secret management.
-
-## Packaging
-
-To build a wheel and distribute the script, see **[PACKAGING.md](PACKAGING.md)** for step-by-step instructions. Summary:
-
-1. From repo root: `pip install build && python3 -m build`
-2. Install from wheel: `pip install dist/hpe_set_bios-1.0.0-py3-none-any.whl`
-3. Run: `hpe-set-bios` or `python3 -m hpe_set_bios`
-
-The script suppresses the urllib3/OpenSSL warning that often appears on macOS (LibreSSL).
+Do not commit `ips.txt` or passwords; use environment variables or secure secret management.
 
 ## Troubleshooting
 
