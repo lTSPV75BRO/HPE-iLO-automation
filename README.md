@@ -13,6 +13,8 @@ Production-ready Python scripts for HPE iLO Redfish: inventory collection and BI
 - [HPEilodetials.py options](#hpeilodetialspy-options)
 - [Secure Boot and certificates](#secure-boot-and-certificates)
 - [Exit codes](#exit-codes)
+- [Batch and automation](#batch-and-automation)
+- [Logging](#logging)
 - [Repository structure](#repository-structure)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -179,11 +181,14 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 
 | Option | Description |
 |--------|-------------|
-| `ilo_ip` or `-f FILE` | One or more iLO IPs, or file with one IP per line |
-| `-u`, `-p` | Username and password |
-| `--password-file FILE` | Per-iLO passwords: one line per host as `IP password` or `IP,password`; `-p` used for IPs not in file |
+| `ilo_ip` or `-f FILE` | One or more iLO IPs, or file with one target per line. **Same file** can include optional username and password: `IP`, `IP password`, `IP username password`, or `IP,password` or `IP,username,password`; missing values use `-u` and `-p`. |
+| `-u`, `-p` | Default username and password for targets that don’t specify them in the `-f` file. Use `-p -` to read password from stdin. |
 | `--check` | Compare current BIOS to desired (read-only); exit 0 if match |
+| `--bios-diff` | With `--check`: only print attributes that differ from desired |
+| `--output-format text\|json` | Output format for `--check`, `--fetch-bios-settings`, and run summary (multi-target) |
 | `--dry-run` | Print desired attributes only; no connect or PATCH |
+| `--list-profiles` | List available BIOS profile names from `bios_profiles/` and exit |
+| `--validate-profile FILE` | Validate a BIOS settings file (key=value format) and exit; no iLO connection |
 | `--bios-settings-file FILE` | Apply BIOS from key=value file (optional Model/CPU header) |
 | `--bios-profile NAME` | Use named profile: `Nutanix_DL360G11_Intel`, `Nutanix_DL385G11_AMD` |
 | `--fetch-bios-settings FILE` | Export current BIOS + model/CPU from first target to FILE; then exit |
@@ -192,14 +197,31 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 | `--match-model-cpu` | With file: apply only if server model and CPU match file header |
 | `--enable-secure-boot` | Enable Secure Boot (Redfish + BIOS attributes) |
 | `--disable-secure-boot` | Disable Secure Boot |
-| `--secure-boot-cert FILE` | Import certificate into Secure Boot db (e.g. Nutanix .cer); BIOS in User mode required |
+| `--secure-boot-cert FILE` | Import certificate into Secure Boot db (e.g. Nutanix .cer); BIOS in User mode required. Skips POST if cert already in db. |
+| `--cert-db-export FILE` | Export Secure Boot db certificate list (names, URIs, fingerprints) to JSON file; no BIOS apply |
+| `--yes`, `--non-interactive` | Never prompt (e.g. when Secure Boot db full and no legacy certs to remove); skip and exit with message |
 | `--reboot` | Reboot server(s) after applying (no prompt) |
 | `--no-reboot-prompt` | Do not ask to reboot |
+| `--skip-reboot` | Never reboot (apply only). Use with automation or when rebooting via other means (e.g. rolling_restart). |
 | `--reset-bios-to-default` | Reset BIOS to factory default (no profile apply). Use with `--reboot` to reboot after reset. |
+| `--retries N` | Max API retries per iLO before skipping (default: 3) |
+| `--workers N` | Parallel workers for multiple iLOs (default: 1). When >1, reboot is skipped. |
 | `--no-verify-ssl` | Disable SSL verification (lab only) |
+| `--log-file FILE` | Append log messages to FILE (see [Logging](#logging)) |
+| `--verbose`, `-v` | Verbose (DEBUG) logging; use with `--log-file` |
 | `--version` | Print script version and exit |
 
 **Rebooting nodes in a cluster:** For HPE nodes that are in a Nutanix cluster with running workloads, do **not** reboot them directly via this script’s prompt or `--reboot` for the whole list. Use **`rolling_restart -h`** on a CVM to restart nodes safely (one at a time, with workload migration). Example on CVM: `rolling_restart -h` for usage.
+
+## Batch and automation
+
+- **Run summary:** With multiple targets (`-f` or several IPs), the script prints a summary at the end: Success / Failed / Skipped counts and IP lists. Use `--output-format json` to get machine-readable `{"success": [...], "failed": [...], "skipped": [...]}`.
+- **Non-interactive:** Use `--yes` (or `--non-interactive`) so the script never prompts (e.g. when Secure Boot db is full and manual cert choice would be needed). It will skip and print a message instead.
+- **Apply without reboot:** Use `--skip-reboot` to apply BIOS/Secure Boot/cert only; reboot manually or via another tool (e.g. `rolling_restart` on CVM).
+- **Different credentials per iLO:** Use one file (`-f`) for IPs, usernames, and passwords. Per line: `IP` (use `-u`/`-p`), or `IP password`, or `IP username password` (space-separated), or `IP,password` or `IP,username,password` (comma-separated). Example: `10.0.0.1`, `10.0.0.2 secret2`, `10.0.0.3 admin pass3` → first uses `-u`/`-p`, second uses `-u` and `secret2`, third uses `admin` and `pass3`.
+- **Password from stdin:** Use `-p -` to read the password from stdin (e.g. `echo "mypass" | python3 HPE_set_bios.py -f ips.txt -p - --check`). Avoids password in process list.
+- **Parallel workers:** Use `--workers N` to process multiple iLOs in parallel. When `N > 1`, reboot is not performed; run with `--reboot` in a second pass if needed, or use `rolling_restart` on the CVM.
+- **Check/fetch as JSON:** Use `--check --output-format json` or `--fetch-bios-settings - --no-write --output-format json` for structured output.
 
 ## HPEilodetials.py options
 
@@ -221,6 +243,7 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 - **Certificate:** Use `--secure-boot-cert <file>` to import a PEM or DER certificate (e.g. Nutanix Secure Boot) into the Authorized Signature Database (db). **BIOS must be in User mode** for enrollment.
 - **Disable:** `--disable-secure-boot` turns Secure Boot off via Redfish and BIOS attributes.
 - Reboot is required for Secure Boot and BIOS changes to take effect.
+- **Deleting certs (db full):** When the db limit is reached, the script can remove legacy Nutanix certs (v1/v2) or prompt you to choose a cert to delete. Deletion uses Redfish `DELETE .../SecureBootDatabases/db/Certificates/{Id}`. iLO generally does **not** allow deleting default/factory database entries; only user-enrolled certs can be removed. If DELETE fails, remove certs manually in iLO (Security → Secure Boot Configuration → Authorized Signatures). Reboot after modifying the db.
 
 ## Exit codes
 
@@ -246,6 +269,20 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 ```
 
 Do not commit `ips.txt` or passwords; use environment variables or secure secret management.
+
+## Logging
+
+To capture what the script does (e.g. for debugging Secure Boot cert attempts or multi-target runs), use **`--log-file FILE`**. Log messages are appended to the file with timestamps.
+
+- **`--log-file hpe_set_bios.log`** — Writes INFO-level messages (targets processed, cert import start/success).
+- **`--log-file hpe_set_bios.log --verbose`** — Writes DEBUG-level messages (each cert POST URI, body keys, status, and response snippet).
+
+Example:
+
+```bash
+python3 HPE_set_bios.py -p 'password' 10.54.93.33 --secure-boot-cert cert.cer --log-file run.log --verbose
+# Then inspect: cat run.log
+```
 
 ## Troubleshooting
 

@@ -1,3 +1,17 @@
-# One iLO IP or hostname per line (copy to ips.txt and fill in)
+# iLO targets: one per line. Optional username and password per line (else use -u and -p).
+#
+# Format (space-separated):
+#   IP                    -> use -u and -p
+#   IP password           -> use -u, this password
+#   IP username password  -> use this username and password
+#
+# Format (comma-separated):
+#   IP,password
+#   IP,username,password
+#
+# Examples (uncomment and edit):
 # 192.168.1.10
-# 192.168.1.11
+# 192.168.1.11 mypassword
+# 192.168.1.12 admin adminpass
+# 192.168.1.13,secret
+# 192.168.1.14,iloadmin,secret

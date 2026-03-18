@@ -12,7 +12,7 @@ Configuration:
     ILO_TIMEOUT      - Request timeout in seconds (default: 60)
     ILO_INPUT_FILE   - File with one iLO IP per line when using -f (default: ips.txt)
   Use -u/--user and -p/--password for CLI; password from ILO_PASSWORD if -p not set.
-  Different passwords per iLO: use --password-file with lines 'IP password' or 'IP,password'; -p is used as default for IPs not in the file.
+  Different credentials per iLO: use -f FILE with optional username/password per line (IP, or "IP password", or "IP username password"; comma or space). Missing username/password use -u and -p.
 
   Multiple iLOs: pass several IPs (ilo_ip ilo_ip ...) or use -f/--file with one IP per line.
   With multiple targets, reboot is never prompted; use --reboot to reboot all after applying.
@@ -39,11 +39,16 @@ import argparse
 import base64
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+# Module-level logger; configured in main() when --log-file or --verbose is used.
+logger = logging.getLogger("hpe_set_bios")
 
 if sys.version_info < (3, 6):
     print("Error: This script requires Python 3.6 or later.", file=sys.stderr)
@@ -52,7 +57,7 @@ if sys.version_info < (3, 6):
 # Suppress urllib3 NotOpenSSLWarning on systems where Python's ssl is linked to LibreSSL
 warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL.*")
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 try:
     from redfish import RedfishClient
@@ -202,6 +207,26 @@ def _list_profile_names() -> List[str]:
     return sorted(names)
 
 
+def _validate_bios_settings_file(path: str) -> Tuple[bool, List[str]]:
+    """Validate a BIOS settings file (key=value lines, optional # Model= etc). Returns (ok, list of error messages)."""
+    errors: List[str] = []
+    try:
+        attrs, meta = _load_bios_settings_file(path)
+        if not attrs and not meta:
+            errors.append("File is empty or has no key=value lines.")
+        for k, v in (attrs or {}).items():
+            if not k or not k.strip():
+                errors.append("Empty attribute name")
+            if "=" in k and not k.strip().startswith("#"):
+                # key=value: key should not contain = except for the separator
+                pass
+        return (len(errors) == 0, errors)
+    except FileNotFoundError:
+        return False, [f"File not found: {path}"]
+    except OSError as e:
+        return False, [f"Read error: {e}"]
+
+
 def _load_profile_by_name(profile_name: str) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, str]]]:
     """Load profile from bios_profiles/<name>.txt. Returns (attrs, metadata) or (None, None) on error."""
     path = _get_profile_path(profile_name)
@@ -228,6 +253,9 @@ SECURE_BOOT_URI = "/redfish/v1/Systems/1/SecureBoot/"
 SECURE_BOOT_DB_CERTIFICATES_URI = "/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/db/Certificates/"
 SECURE_BOOT_DB_CERTIFICATES_PAYLOAD_URI = "/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/db/Certificates/Payload"
 SECURE_BOOT_DB_CERTIFICATES_COLLECTION_URI = "/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/db/Certificates"
+
+# Additional URIs seen on some iLO/Redfish implementations (not used in this simplified flow).
+SECURE_BOOT_CERT_POST_URIS_EXTRA: List[str] = []
 
 def _get_attributes(client: Any, uri: str) -> Dict[str, Any]:
     """GET resource and return its Attributes dict, or empty dict on error."""
@@ -403,10 +431,12 @@ def fetch_bios_settings(
     timeout: int = DEFAULT_TIMEOUT,
     verify_ssl: bool = True,
     no_write: bool = False,
+    output_format: str = "text",
 ) -> Tuple[bool, str]:
     """
     GET current BIOS Attributes and system model/CPU from iLO.
     If no_write is False, write to output_path; if True, return the export text as the message (for printing).
+    output_format: "text" (default) or "json" (when no_write, message is JSON string).
     Returns (success: bool, message: str).
     """
     client = None
@@ -425,6 +455,9 @@ def fetch_bios_settings(
         if not attrs:
             return False, "No BIOS Attributes returned from iLO"
         if no_write:
+            if output_format == "json":
+                data = {"ilo_ip": ilo_ip, "Model": model, "CPU": cpu_vendor, "CPU_Model": cpu_model, "Attributes": attrs}
+                return True, json.dumps(data, indent=2)
             lines = _bios_export_lines(model, cpu_vendor, cpu_model, attrs)
             return True, "\n".join(lines) + "\n"
         _save_bios_settings_file(output_path, model, cpu_vendor, cpu_model, attrs)
@@ -441,43 +474,66 @@ def fetch_bios_settings(
 
 def _load_ips(path: str) -> List[str]:
     """Load IPs from file (one per line); skip empty lines and # comments."""
-    ips: List[str] = []
-    try:
-        with open(path, "r", encoding=FILE_ENCODING, errors="replace") as f:
-            for line in f:
-                line = line.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                ips.append(line)
-    except OSError:
-        raise
+    ips, _, _ = _load_ips_passwords_usernames(path)
     return ips
 
 
-def _load_password_file(path: str) -> Dict[str, str]:
+def _load_ips_passwords_usernames(path: str) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
     """
-    Load IP/host -> password from file. One entry per line.
-    Format: IP password  or  IP,password  or  IP:password  (first separator wins).
-    Lines starting with # and empty lines are skipped. Leading/trailing space trimmed.
+    Load IPs and optional per-IP passwords and usernames from one file (-f file).
+    One line per target. Format per line:
+      IP                    -> use -u and -p for this host
+      IP password           -> use -u, this password (password may contain spaces)
+      IP username password  -> use this username and password (space-separated; password may contain spaces)
+      IP,password           -> use -u, this password (comma-separated)
+      IP,username,password  -> use this username and password (comma-separated)
+    Skip empty lines and # comments. Returns (list of IPs, dict IP->password, dict IP->username).
     """
-    out: Dict[str, str] = {}
+    ips: List[str] = []
+    passwords: Dict[str, str] = {}
+    usernames: Dict[str, str] = {}
     try:
         with open(path, "r", encoding=FILE_ENCODING, errors="replace") as f:
             for line in f:
                 line = line.split("#", 1)[0].strip()
                 if not line:
                     continue
-                for sep in (",", ":", " ", "\t"):
-                    if sep in line:
-                        idx = line.index(sep)
-                        ip_or_host = line[:idx].strip()
-                        pwd = line[idx + 1 :].strip()
-                        if ip_or_host:
-                            out[ip_or_host] = pwd
-                        break
+                if "," in line:
+                    parts = [p.strip() for p in line.split(",")]
+                    if not parts or not parts[0]:
+                        continue
+                    ip_part = parts[0]
+                    if len(parts) == 1:
+                        pwd_part = ""
+                        user_part = ""
+                    elif len(parts) == 2:
+                        user_part = ""
+                        pwd_part = parts[1]
+                    else:
+                        user_part = parts[1]
+                        pwd_part = ",".join(parts[2:]).strip()
+                else:
+                    parts = line.split(None, 2)
+                    if not parts or not parts[0]:
+                        continue
+                    ip_part = parts[0]
+                    if len(parts) == 1:
+                        user_part = ""
+                        pwd_part = ""
+                    elif len(parts) == 2:
+                        user_part = ""
+                        pwd_part = parts[1]
+                    else:
+                        user_part = parts[1]
+                        pwd_part = parts[2]
+                ips.append(ip_part)
+                if pwd_part:
+                    passwords[ip_part] = pwd_part
+                if user_part:
+                    usernames[ip_part] = user_part
     except OSError:
         raise
-    return out
+    return ips, passwords, usernames
 
 
 def probe_ilo_alive(
@@ -717,9 +773,246 @@ def _verify_cert_in_secure_boot_db(client: Any, cert_pem: str) -> bool:
         return False
 
 
-# Retries for Secure Boot cert upload (and short delay between retries)
-SECURE_BOOT_CERT_RETRIES = 3
+# iLO returns this when the Secure Boot db certificate limit is reached
+SECURE_BOOT_DB_LIMIT_MESSAGE_IDS = ("CreateLimitReachedForResource", "Base.1.17.CreateLimitReachedForResource")
+
+
+def _export_secure_boot_db_to_file(client: Any, output_path: str, ilo_ip: str = "") -> bool:
+    """List Secure Boot db certificates and write to output_path as JSON. Returns True on success."""
+    entries = _list_secure_boot_db_certificates(client)
+    export = {"ilo_ip": ilo_ip, "certificates": [{"name": e.get("name") or "", "uri": e.get("uri") or "", "fingerprint": e.get("fingerprint")} for e in entries]}
+    try:
+        with open(output_path, "w", encoding=FILE_ENCODING) as f:
+            json.dump(export, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def _list_secure_boot_db_certificates(client: Any) -> List[Dict[str, Any]]:
+    """GET db Certificates collection and return list of { 'uri': str, 'name': str, 'fingerprint': str or None, 'data': dict }."""
+    result = []
+    try:
+        resp = client.get(SECURE_BOOT_DB_CERTIFICATES_COLLECTION_URI)
+        if resp.status != 200:
+            return result
+        data = getattr(resp, "dict", None) or getattr(resp, "data", None)
+        if not data:
+            return result
+        members = data.get("Members") or []
+        for member in members:
+            uri = member.get("@odata.id") if isinstance(member, dict) else (member if isinstance(member, str) else None)
+            if not uri:
+                continue
+            name = ""
+            fp = None
+            cert_data = {}
+            try:
+                cr = client.get(uri)
+                if cr.status != 200:
+                    result.append({"uri": uri, "name": "", "fingerprint": None, "data": {}})
+                    continue
+                cert_data = getattr(cr, "dict", None) or getattr(cr, "data", None) or {}
+                name = (cert_data.get("Name") or cert_data.get("Description") or cert_data.get("Id") or "").strip()
+                if not name and uri:
+                    # Use last path segment for unnamed entries (e.g. ".../Certificates/17" -> "entry 17")
+                    name = uri.rstrip("/").split("/")[-1] if "/" in uri else uri
+                    try:
+                        int(name)
+                        name = f"(no name, id {name})"
+                    except ValueError:
+                        name = f"(no name, {name})"
+                for key in ("FingerprintHash", "Fingerprint", "fingerprint", "fingerprint_hash"):
+                    v = cert_data.get(key)
+                    if v:
+                        fp = str(v).strip().lower().replace(" ", "").replace(":", "")
+                        break
+            except Exception:
+                pass
+            result.append({"uri": uri, "name": name, "fingerprint": fp, "data": cert_data})
+    except Exception:
+        pass
+    return result
+
+
+def _is_nutanix_legacy_cert(entry: Dict[str, Any], our_fingerprint: Optional[str]) -> bool:
+    """True if entry looks like an older Nutanix SB cert (v1/v2) that we can remove to make room for v3."""
+    name = (entry.get("name") or "").lower()
+    if "nutanix" not in name:
+        return False
+    # Do not remove the cert we're adding (match by fingerprint if we have it)
+    fp = entry.get("fingerprint")
+    if our_fingerprint and fp and (fp == our_fingerprint or our_fingerprint.endswith(fp) or fp.endswith(our_fingerprint)):
+        return False
+    # Prefer removing names that suggest v1/v2 (e.g. "Nutanix Secure Boot v1", "Nutanix v2")
+    if "v3" in name or "version 3" in name:
+        return False
+    return True
+
+
+def _delete_secure_boot_db_certificate(client: Any, uri: str) -> bool:
+    """
+    DELETE one certificate from the Secure Boot Authorized Signature Database (db).
+
+    Redfish API (HPE):
+      DELETE /redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/{database_type}/Certificates/{Id}
+    For db: DELETE .../SecureBootDatabases/db/Certificates/{Id}
+    Response: 200 OK or 204 No Content. Reboot required after modifying Secure Boot databases.
+
+    Constraints: iLO generally does not allow deletion from default/factory databases; only
+    user-enrolled entries can be removed. Permissions: Configure Components or Administrator.
+
+    Tries: client.delete(uri), _rest_request(uri, method='DELETE'), request(uri, method='DELETE'),
+    then raw HTTP DELETE via requests if client exposes default_url and credentials.
+    """
+    for attempt in ("delete", "_rest_request", "request"):
+        fn = getattr(client, attempt, None)
+        if not callable(fn):
+            continue
+        try:
+            if attempt == "delete":
+                resp = fn(uri)
+            else:
+                resp = fn(uri, method="DELETE")
+            status = getattr(resp, "status", None)
+            if status in (200, 204):
+                return True
+        except Exception:
+            pass
+    # Fallback: raw DELETE via requests if client exposes base URL and auth
+    try:
+        import requests  # noqa: F401
+        base = getattr(client, "default_url", None) or getattr(client, "root_url", None) or getattr(client, "host", None)
+        if base and isinstance(uri, str) and uri.startswith("/"):
+            url = (base.rstrip("/") + uri) if not uri.startswith("http") else uri
+            user = getattr(client, "username", None) or getattr(client, "default_username", None)
+            pwd = getattr(client, "password", None) or getattr(client, "default_password", None)
+            verify = getattr(client, "default_verify_cert", True)
+            kwargs = {"timeout": 30, "verify": verify}
+            if user and pwd:
+                kwargs["auth"] = (user, pwd)
+            r = requests.delete(url, **kwargs)
+            if r.status_code in (200, 204):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_remove_legacy_nutanix_certs(
+    client: Any,
+    cert_pem_to_add: str,
+    already_prompted: bool = False,
+    already_delete_failed: bool = False,
+    non_interactive: bool = False,
+) -> Tuple[int, bool, bool]:
+    """
+    When the db is full, remove older Nutanix certs (v1/v2) so v3 can be added.
+    If no Nutanix v1/v2 certs are found, list all certs and ask the user which to delete (once per run).
+    Returns (number of certs removed, whether we showed the list and prompted, whether a delete was attempted and failed).
+    If already_delete_failed is True, skips all delete attempts and just prints the hint (no retry).
+    If non_interactive is True, never prompt; print message and return (0, True, False) when manual choice would be needed.
+    """
+    if already_delete_failed:
+        print("  Secure Boot db is still full (DELETE failed earlier). Remove a cert manually in iLO (Security → Secure Boot Configuration → Authorized Signatures) and re-run.", file=sys.stderr)
+        return (0, False, True)
+
+    our_fp = _cert_sha256_fingerprint(cert_pem_to_add)
+    entries = _list_secure_boot_db_certificates(client)
+    to_remove = [e for e in entries if _is_nutanix_legacy_cert(e, our_fp)]
+    removed = 0
+    delete_failed = False
+
+    if to_remove:
+        for entry in to_remove:
+            uri = entry.get("uri")
+            name = entry.get("name") or uri
+            if _delete_secure_boot_db_certificate(client, uri):
+                removed += 1
+                print(f"  Removed legacy Nutanix cert from db: {name}", file=sys.stderr)
+                logger.info("Removed legacy Nutanix cert from db: %s", name)
+            else:
+                print(f"  Could not remove cert {name} (DELETE not supported or failed).", file=sys.stderr)
+                print("  Many HPE iLOs do not allow deleting Secure Boot db certs via API; use iLO web UI to remove certs.", file=sys.stderr)
+                delete_failed = True
+                break  # Do not try more deletes after first failure
+        return (removed, False, delete_failed)
+
+    # No Nutanix v1/v2 found; list all certs and ask user which to delete (only once per run)
+    if not entries:
+        print("  Secure Boot db is full but no certs could be listed.", file=sys.stderr)
+        return (0, False, False)
+
+    if already_prompted:
+        print("  Secure Boot db is still full. Remove a cert manually in iLO (Security → Secure Boot Configuration → Authorized Signatures) and re-run.", file=sys.stderr)
+        return (0, False, False)
+
+    if non_interactive or not sys.stdin.isatty():
+        print("  Secure Boot db is full; no legacy Nutanix certs to remove. Use iLO UI (Security → Secure Boot Configuration → Authorized Signatures) or re-run with an interactive terminal to choose a cert to delete.", file=sys.stderr)
+        return (0, True, False)
+
+    cert_list_max = 40
+    print("  No Nutanix v1/v2 certs found. Current certificates in Secure Boot db (Authorized Signatures):", file=sys.stderr)
+    if len(entries) > cert_list_max:
+        print(
+            f"  Showing first {cert_list_max} of {len(entries)} certs. Type 'all' at the prompt to show the full list.",
+            file=sys.stderr,
+        )
+    entries_to_show = entries[:cert_list_max]
+    for i, entry in enumerate(entries_to_show, 1):
+        name = entry.get("name") or "(no name)"
+        uri = entry.get("uri", "")
+        print(f"    {i}. {name}", file=sys.stderr)
+        logger.debug("Db cert %s: %s %s", i, name, uri)
+
+    print("  If DELETE fails, remove certs manually in iLO: Security → Secure Boot Configuration → Authorized Signatures (db).", file=sys.stderr)
+    try:
+        while True:
+            prompt = "  Enter number(s) to delete (e.g. 1 or 1,3), type 'all' to show full list, or 'q' to skip: "
+            choice = input(prompt).strip().lower()
+            if not choice or choice == "q":
+                return (0, True, False)
+            if choice == "all":
+                for j, entry in enumerate(entries[cert_list_max:], cert_list_max + 1):
+                    name = entry.get("name") or "(no name)"
+                    uri = entry.get("uri", "")
+                    print(f"    {j}. {name}", file=sys.stderr)
+                    logger.debug("Db cert %s: %s %s", j, name, uri)
+                continue
+            break
+        indices = []
+        for part in choice.replace(",", " ").split():
+            try:
+                n = int(part)
+                if 1 <= n <= len(entries):
+                    indices.append(n - 1)
+                else:
+                    print(f"  Invalid number {n}; valid range 1-{len(entries)}.", file=sys.stderr)
+            except ValueError:
+                pass
+        for idx in sorted(set(indices), reverse=True):
+            entry = entries[idx]
+            uri = entry.get("uri")
+            name = entry.get("name") or uri
+            if _delete_secure_boot_db_certificate(client, uri):
+                removed += 1
+                print(f"  Removed cert from db: {name}", file=sys.stderr)
+                logger.info("Removed user-selected cert from db: %s", name)
+            else:
+                print(f"  Could not remove cert {name} (DELETE not supported or failed).", file=sys.stderr)
+                print("  Many HPE iLOs do not allow deleting Secure Boot db certs via API; use iLO web UI to remove certs.", file=sys.stderr)
+                delete_failed = True
+                break  # Do not try more deletes after first failure
+    except (EOFError, KeyboardInterrupt):
+        print("  Skipped.", file=sys.stderr)
+    return (removed, True, delete_failed)
+
+
+# Secure Boot cert upload: single pass through all URI/body combinations (no retry loop)
+SECURE_BOOT_CERT_RETRIES = 1
 SECURE_BOOT_CERT_RETRY_DELAY_SEC = 2
+# When True, try only the first URI + first body (one cert POST total); when False, try all URI/body combinations once each.
+SECURE_BOOT_CERT_ONE_ATTEMPT = False
 # After 202 Accepted, iLO may need time to persist; wait before first verification
 SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC = 4
 SECURE_BOOT_CERT_VERIFY_RETRIES = 5
@@ -734,27 +1027,125 @@ def _pem_to_64_char_lines(pem: str) -> str:
     return "-----BEGIN CERTIFICATE-----\n" + "\n".join(lines) + "\n-----END CERTIFICATE-----\n"
 
 
-def _import_secure_boot_cert(client: Any, cert_pem: str) -> bool:
+def _extract_extended_info_msgs(obj: Any) -> Optional[str]:
+    """From a Redfish error dict, find @Message.ExtendedInfo array and return ' | '.join(Message) or None."""
+    if not isinstance(obj, dict):
+        return None
+    # Direct keys (error object or top-level)
+    for key in ("@Message.ExtendedInfo", "Message.ExtendedInfo", "ExtendedInfo"):
+        ext = obj.get(key)
+        if isinstance(ext, list) and ext:
+            parts = []
+            for entry in ext:
+                if isinstance(entry, dict):
+                    msg = entry.get("Message") or entry.get("message") or entry.get("MessageId") or ""
+                    if msg:
+                        parts.append(str(msg).strip())
+                elif isinstance(entry, str):
+                    parts.append(entry.strip())
+            if parts:
+                return " | ".join(parts)[:600]
+    # Recurse into error/Error
+    for key in ("error", "Error"):
+        sub = obj.get(key)
+        if isinstance(sub, dict):
+            out = _extract_extended_info_msgs(sub)
+            if out:
+                return out
+    return None
+
+
+def _cert_response_error_body(resp: Any) -> str:
+    """Extract error body from a Redfish response for logging (400/404/405 etc). Parses @Message.ExtendedInfo when present."""
+    # 1) Prefer resp.dict (ilorest often parses body here)
+    data = getattr(resp, "dict", None) or getattr(resp, "data", None)
+    if isinstance(data, dict):
+        out = _extract_extended_info_msgs(data)
+        if out:
+            return out
+        err = data.get("error") or data.get("Error")
+        if isinstance(err, dict):
+            for key in ("message", "Message", "description", "Description"):
+                val = err.get(key)
+                if isinstance(val, str) and "ExtendedInfo" not in val:
+                    return val[:500]
+    # 2) Full body from .text or .read()
+    text = getattr(resp, "text", None) or ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    raw = (text or "").strip()
+    if getattr(resp, "read", None) and callable(resp.read) and (not raw or "ExtendedInfo" in raw):
+        try:
+            body = resp.read()
+            if isinstance(body, bytes):
+                body = body.decode("utf-8", errors="replace")
+            raw = (body or "").strip() or raw
+        except Exception:
+            pass
+    if raw and (raw.startswith("{") or "ExtendedInfo" in raw):
+        try:
+            data = json.loads(raw)
+            out = _extract_extended_info_msgs(data)
+            if out:
+                return out
+            err = data.get("error") or data.get("Error") or data
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("Message")
+                if isinstance(msg, str) and "ExtendedInfo" not in msg:
+                    return msg[:500]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if raw:
+        return raw[:500]
+    return ""
+
+
+def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool = False) -> bool:
     """POST certificate to Secure Boot Authorized Signature Database (db). Tries multiple URIs and payload formats. Returns True on success or if cert already in db. BIOS must be in User mode."""
+    # Idempotent: skip POST if cert is already in db (by fingerprint)
+    if _verify_cert_in_secure_boot_db(client, cert_pem):
+        print("Certificate already in Secure Boot db; no change needed.")
+        return True
+    logger.info("Secure Boot cert import: single pass over URIs and payload formats.")
     # Normalize: CRLF -> LF, 64-char lines for base64 (some iLOs require), trailing newline (per HPE doc)
     cert_string = _pem_to_64_char_lines(cert_pem)
     # Base64-only (no PEM headers) for variants that expect it
     b64_only = _normalize_cert_pem_for_compare(cert_pem)
+    # Existing URIs (unchanged order – known to work on many iLOs)
     uris_to_try = [
         SECURE_BOOT_DB_CERTIFICATES_URI,
         "/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/db/Certificates",
         SECURE_BOOT_DB_CERTIFICATES_PAYLOAD_URI,
     ]
-    # HPE doc: CertificateString + CertificateType "PEM" first; then other variants
+    # Existing bodies (unchanged order)
     bodies_to_try = [
         {"CertificateString": cert_string, "CertificateType": "PEM"},
         {"Certificate": cert_string},
         {"CertificateString": cert_string, "CertificateType": "x509"},
         {"CertificateString": b64_only, "CertificateType": "Base64"},
     ]
+    # Additional payload variants for other iLO/Redfish implementations (tried after the above)
+    bodies_extra = [
+        {"CertificateString": cert_string},  # no CertificateType
+        {"Certificate": cert_string, "CertificateType": "PEM"},
+        {"Certificate": cert_string, "CertificateType": "x509"},
+        {"Certificate": b64_only, "CertificateType": "Base64"},
+        {"CertificateString": cert_string, "CertificateType": "X509"},
+        {"CertificateString": cert_string, "CertificateType": "x509 PEM"},
+        {"CertificateString": b64_only},
+        {"Body": cert_string},
+        {"CertificateString": cert_string, "CertificateEncoding": "PEM"},
+        {"Certificate": cert_string, "Encoding": "PEM"},
+        {"Cert": cert_string},
+        {"CertificateString": cert_string, "CertificateType": "DER"},
+        {"CertificateBytes": b64_only},
+    ]
     last_err = None
+    cert_removal_prompted = False  # Only prompt once per run when db is full and no legacy Nutanix certs
+    cert_delete_failed = False  # Once a delete fails, do not retry delete (skip further delete attempts)
     for attempt in range(1, SECURE_BOOT_CERT_RETRIES + 1):
         try:
+            # Try existing URIs with existing bodies first (no change to current behavior)
             for uri in uris_to_try:
                 for body in bodies_to_try:
                     try:
@@ -763,8 +1154,10 @@ def _import_secure_boot_cert(client: Any, cert_pem: str) -> bool:
                         last_err = str(e)
                         continue
                     status = getattr(resp, "status", None)
-                    resp_text = (getattr(resp, "text", None) or "")[:400]
+                    resp_text = _cert_response_error_body(resp) or (getattr(resp, "text", None) or "").strip()[:400]
+                    logger.debug("Cert POST uri=%s body_keys=%s status=%s resp=%s", uri, list(body.keys()), status, (resp_text[:200] if resp_text else ""))
                     if status in (200, 201, 202, 204):
+                        logger.info("Cert accepted: status=%s", status)
                         print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
                         time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
                         for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
@@ -776,15 +1169,181 @@ def _import_secure_boot_cert(client: Any, cert_pem: str) -> bool:
                         print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
                         return True
                     if status and 400 <= status < 500:
-                        time.sleep(1)
+                        if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                            time.sleep(1)
                         if _verify_cert_in_secure_boot_db(client, cert_pem):
                             print("Certificate already in db; verified present.")
                             return True
-                        last_err = f"status {status} {resp_text}"
+                        last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                        logger.debug("Cert POST 4xx: %s %s", uri, last_err)
+                        # If db limit reached, try removing legacy Nutanix certs (v1/v2) then retry once
+                        if any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                            removed, prompted, delete_failed = _try_remove_legacy_nutanix_certs(
+                                client, cert_pem, cert_removal_prompted, cert_delete_failed, non_interactive
+                            )
+                            cert_removal_prompted = cert_removal_prompted or prompted
+                            cert_delete_failed = cert_delete_failed or delete_failed
+                            if cert_delete_failed:
+                                print(
+                                    "Secure Boot db is still full (DELETE failed earlier). Skipping further cert POST attempts.",
+                                    file=sys.stderr,
+                                )
+                                return False
+                            if removed > 0:
+                                try:
+                                    resp2 = client.post(uri, body)
+                                    st2 = getattr(resp2, "status", None)
+                                    if st2 in (200, 201, 202, 204):
+                                        logger.info("Cert accepted after removing legacy certs: status=%s", st2)
+                                        print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
+                                        time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
+                                        for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                            if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                                print("Certificate verified: present in iLO Secure Boot db.")
+                                                return True
+                                            if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
+                                                time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+                                        print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
+                                        return True
+                                except Exception:
+                                    pass
                         print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
+                        if SECURE_BOOT_CERT_ONE_ATTEMPT:
+                            break
                         continue
-                    last_err = f"status {status} {resp_text}"
+                    last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                    logger.debug("Cert POST fail: %s %s", uri, last_err)
                     print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
+                    if SECURE_BOOT_CERT_ONE_ATTEMPT:
+                        break
+                if SECURE_BOOT_CERT_ONE_ATTEMPT:
+                    break
+            # Then try extra URIs with existing bodies (skipped when SECURE_BOOT_CERT_ONE_ATTEMPT)
+            if not SECURE_BOOT_CERT_ONE_ATTEMPT:
+                for uri in SECURE_BOOT_CERT_POST_URIS_EXTRA:
+                    for body in bodies_to_try:
+                        try:
+                            resp = client.post(uri, body)
+                        except Exception as e:
+                            last_err = str(e)
+                            continue
+                        status = getattr(resp, "status", None)
+                        resp_text = _cert_response_error_body(resp) or (getattr(resp, "text", None) or "").strip()[:400]
+                        logger.debug("Cert POST (extra URI) uri=%s body_keys=%s status=%s resp=%s", uri, list(body.keys()), status, (resp_text[:200] if resp_text else ""))
+                        if status in (200, 201, 202, 204):
+                            logger.info("Cert accepted: status=%s", status)
+                            print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
+                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
+                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                    print("Certificate verified: present in iLO Secure Boot db.")
+                                    return True
+                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
+                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+                            print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
+                            return True
+                        if status and 400 <= status < 500:
+                            if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                                time.sleep(1)
+                            if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                print("Certificate already in db; verified present.")
+                                return True
+                            last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                            if any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                                removed, prompted, delete_failed = _try_remove_legacy_nutanix_certs(
+                                    client, cert_pem, cert_removal_prompted, cert_delete_failed, non_interactive
+                                )
+                                cert_removal_prompted = cert_removal_prompted or prompted
+                                cert_delete_failed = cert_delete_failed or delete_failed
+                                if cert_delete_failed:
+                                    print(
+                                        "Secure Boot db is still full (DELETE failed earlier). Skipping further cert POST attempts.",
+                                        file=sys.stderr,
+                                    )
+                                    return False
+                                if removed > 0:
+                                    try:
+                                        resp2 = client.post(uri, body)
+                                        st2 = getattr(resp2, "status", None)
+                                        if st2 in (200, 201, 202, 204):
+                                            print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
+                                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
+                                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                                if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                                    print("Certificate verified: present in iLO Secure Boot db.")
+                                                    return True
+                                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
+                                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+                                            return True
+                                    except Exception:
+                                        pass
+                            print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
+                            continue
+                        last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                        print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
+                # Then try all URIs with extra body variants
+                all_uris = uris_to_try + SECURE_BOOT_CERT_POST_URIS_EXTRA
+                for uri in all_uris:
+                    for body in bodies_extra:
+                        try:
+                            resp = client.post(uri, body)
+                        except Exception as e:
+                            last_err = str(e)
+                            continue
+                        status = getattr(resp, "status", None)
+                        resp_text = _cert_response_error_body(resp) or (getattr(resp, "text", None) or "").strip()[:400]
+                        logger.debug("Cert POST (extra body) uri=%s body_keys=%s status=%s resp=%s", uri, list(body.keys()), status, (resp_text[:200] if resp_text else ""))
+                        if status in (200, 201, 202, 204):
+                            logger.info("Cert accepted: status=%s", status)
+                            print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
+                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
+                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                    print("Certificate verified: present in iLO Secure Boot db.")
+                                    return True
+                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
+                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+                            print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
+                            return True
+                        if status and 400 <= status < 500:
+                            if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                                time.sleep(1)
+                            if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                print("Certificate already in db; verified present.")
+                                return True
+                            last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                            if any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
+                                removed, prompted, delete_failed = _try_remove_legacy_nutanix_certs(
+                                    client, cert_pem, cert_removal_prompted, cert_delete_failed, non_interactive
+                                )
+                                cert_removal_prompted = cert_removal_prompted or prompted
+                                cert_delete_failed = cert_delete_failed or delete_failed
+                                if cert_delete_failed:
+                                    print(
+                                        "Secure Boot db is still full (DELETE failed earlier). Skipping further cert POST attempts.",
+                                        file=sys.stderr,
+                                    )
+                                    return False
+                                if removed > 0:
+                                    try:
+                                        resp2 = client.post(uri, body)
+                                        st2 = getattr(resp2, "status", None)
+                                        if st2 in (200, 201, 202, 204):
+                                            print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
+                                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
+                                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                                if _verify_cert_in_secure_boot_db(client, cert_pem):
+                                                    print("Certificate verified: present in iLO Secure Boot db.")
+                                                    return True
+                                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
+                                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+                                            return True
+                                    except Exception:
+                                        pass
+                            print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
+                            continue
+                        last_err = f"status {status}" + (f" {resp_text}" if resp_text else "")
+                        print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
             if attempt < SECURE_BOOT_CERT_RETRIES:
                 print(f"  Cert upload attempt {attempt}/{SECURE_BOOT_CERT_RETRIES} failed; retrying in {SECURE_BOOT_CERT_RETRY_DELAY_SEC}s ...", file=sys.stderr)
                 time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
@@ -809,6 +1368,8 @@ def set_bios(
     verify_ssl: bool = True,
     prompt_reboot: bool = True,
     yes_reboot: bool = False,
+    skip_reboot: bool = False,
+    non_interactive: bool = False,
     attribute_overrides: Optional[Dict[str, str]] = None,
     always_apply_keys: Optional[Iterable[str]] = None,
     cert_pem: Optional[str] = None,
@@ -916,10 +1477,13 @@ def set_bios(
                 _enable_secure_boot_resource(client)
             if cert_pem:
                 print("Note: Certificate enrollment requires BIOS/Platform to be in User mode.")
-                _import_secure_boot_cert(client, cert_pem)
-            if yes_reboot:
+                cert_ok = _import_secure_boot_cert(client, cert_pem, non_interactive)
+                if not cert_ok:
+                    print("Error: Secure Boot certificate enrollment failed; skipping server.", file=sys.stderr)
+                    return 1, client
+            if not skip_reboot and yes_reboot:
                 _do_reset(client)
-            elif prompt_reboot and sys.stdin.isatty():
+            elif not skip_reboot and prompt_reboot and sys.stdin.isatty():
                 print("For nodes in a Nutanix cluster with workloads, consider: rolling_restart -h (on CVM).")
                 r = input("Reboot server anyway (iLO Reset)? [y/N]: ").strip().lower()
                 if r == "y" or r == "yes":
@@ -948,7 +1512,10 @@ def set_bios(
         # 3. Import certificate to Secure Boot db if requested (BIOS must be in User mode)
         if cert_pem:
             print("Note: Certificate enrollment requires BIOS/Platform to be in User mode.")
-            _import_secure_boot_cert(client, cert_pem)
+            cert_ok = _import_secure_boot_cert(client, cert_pem, non_interactive)
+            if not cert_ok:
+                print("Error: Secure Boot certificate enrollment failed; skipping server.", file=sys.stderr)
+                return 1, client
 
         # 4. Confirm: read back pending Settings
         pending = _get_attributes(client, BIOS_SETTINGS_URI)
@@ -959,7 +1526,7 @@ def set_bios(
         print()
 
         # 5. Reboot prompt (or --reboot when multi: no prompt, but still reboot if requested)
-        if prompt_reboot:
+        if not skip_reboot and prompt_reboot:
             if yes_reboot:
                 _do_reset(client)
             elif sys.stdin.isatty():
@@ -971,7 +1538,7 @@ def set_bios(
                     print("Skipped reboot. Changes will take effect on next manual reboot.")
             else:
                 print("Non-interactive: skipped reboot prompt. Use --reboot to reboot, or reboot manually.")
-        elif yes_reboot:
+        elif not skip_reboot and yes_reboot:
             _do_reset(client)
 
         return 0, client
@@ -996,12 +1563,15 @@ def check_bios(
     cert_pem: Optional[str] = None,
     base_desired: Optional[Dict[str, str]] = None,
     profile_name: Optional[str] = None,
+    bios_diff: bool = False,
+    output_format: str = "text",
 ) -> int:
     """
     Connect to iLO, detect CPU type, get current BIOS and desired profile,
     print comparison (current vs desired) and return 0 if all match, 1 if any differ.
     If base_desired is provided (e.g. from file), use it as the base; else use built-in by CPU.
     If cert_pem is provided, also checks whether that certificate is enrolled in Secure Boot db.
+    bios_diff: if True, only print attributes that differ. output_format: "text" or "json".
     No PATCH or reboot; read-only.
     """
     client = None
@@ -1067,36 +1637,65 @@ def check_bios(
             # BIOS GET often does not include SecureBoot string; comparison uses SecureBootEnable from resource only
             desired.pop("SecureBoot", None)
 
-        print(f"{'Attribute':<35} {'Current':<28} {'Desired':<28} {'Match'}")
-        print("-" * 95)
-
+        # Build list of (key, cur_str, want_str, match) for optional filtering and JSON
+        rows: List[Tuple[str, str, str, bool]] = []
         all_match = True
+        if output_format != "json":
+            if bios_diff:
+                print("Attributes that differ from desired profile:")
+                print(f"{'Attribute':<35} {'Current':<28} {'Desired':<28}")
+                print("-" * 92)
+            else:
+                print(f"{'Attribute':<35} {'Current':<28} {'Desired':<28} {'Match'}")
+                print("-" * 95)
         for key in sorted(desired.keys()):
             cur = current.get(key)
             cur_str = str(cur) if cur is not None else "<not set>"
             want = desired[key]
             # VMD port keys: if iLO does not report the attribute (port not present on platform), treat as N/A not DIFF
             if key.startswith("Vmdon") and cur is None:
-                print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28} {'N/A'}")
+                rows.append((key, cur_str[:27], str(want)[:27], True))  # N/A counts as match for display
+                if not bios_diff and output_format != "json":
+                    print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28} {'N/A'}")
                 continue
             match = cur is not None and str(cur).strip() == str(want).strip()
             if not match:
                 all_match = False
-            status = "OK" if match else "DIFF"
-            print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28} {status}")
-
-        print()
-        if all_match:
-            print("All BIOS settings match the desired profile.")
-        else:
-            print("One or more BIOS settings differ from the desired profile.")
+            rows.append((key, cur_str[:27], str(want)[:27], match))
+            if output_format != "json" and (not bios_diff or not match):
+                if bios_diff:
+                    print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28}")
+                else:
+                    status = "OK" if match else "DIFF"
+                    print(f"{key:<35} {cur_str[:27]:<28} {str(want)[:27]:<28} {status}")
 
         # Check if certificate (file) is enrolled in Secure Boot db
+        cert_enrolled: Optional[bool] = None
         if cert_pem:
-            enrolled = _verify_cert_in_secure_boot_db(client, cert_pem)
-            print(f"Certificate (file) enrolled in Secure Boot db: {'Yes' if enrolled else 'No'}")
-            if not enrolled:
+            cert_enrolled = _verify_cert_in_secure_boot_db(client, cert_pem)
+            if not cert_enrolled:
                 all_match = False
+
+        if output_format == "json":
+            diffs = [{"attribute": r[0], "current": r[1], "desired": r[2]} for r in rows if not r[3]]
+            out = {
+                "ilo_ip": ilo_ip,
+                "model": display_model,
+                "profile": display_profile,
+                "all_match": all_match,
+                "cert_enrolled_in_db": cert_enrolled,
+                "diffs": diffs,
+            }
+            print(json.dumps(out, indent=2))
+        else:
+            if not bios_diff:
+                print()
+            if all_match:
+                print("All BIOS settings match the desired profile.")
+            else:
+                print("One or more BIOS settings differ from the desired profile.")
+            if cert_pem is not None:
+                print(f"Certificate (file) enrolled in Secure Boot db: {'Yes' if cert_enrolled else 'No'}")
 
         return 0 if all_match else 1
     except Exception as e:
@@ -1159,7 +1758,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="hpe-set-bios",
         description="Set HPE node BIOS via iLO Redfish (production-ready, idempotent). BIOS is optional: use built-in profile, --bios-settings-file, or --no-bios.",
-        epilog="Use --fetch-bios-settings to export from a reference server; then --bios-settings-file + --match-model-cpu to apply to same model/CPU.",
+        epilog="Examples: --check (compare only); --list-profiles (show profiles); -f ips.txt -p 'pw' (apply); -f ips.txt --no-bios --secure-boot-cert cert.cer --skip-reboot (cert only, no reboot); --fetch-bios-settings out.txt --no-write (print BIOS export).",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
@@ -1173,23 +1772,20 @@ def main() -> int:
         const=DEFAULT_INPUT_FILE,
         default=None,
         metavar="PATH",
-        help=f"File with one iLO IP per line; -f alone uses {DEFAULT_INPUT_FILE}",
+        help=f"File with one target per line: IP, or 'IP password', or 'IP user password' (space/comma); missing user/password use -u/-p. -f alone uses {DEFAULT_INPUT_FILE}",
     )
     parser.add_argument("-u", "--user", "--username", dest="user", default=DEFAULT_USERNAME, metavar="USER", help=f"iLO username (default: {DEFAULT_USERNAME})")
-    parser.add_argument("-p", "--password", default=DEFAULT_PASSWORD, help="iLO password (default: ILO_PASSWORD env). With --password-file, used as default for IPs not in file.")
-    parser.add_argument(
-        "--password-file",
-        metavar="FILE",
-        default=None,
-        help="File with per-iLO passwords: one line per host as 'IP password' or 'IP,password'. Overrides -p for those IPs.",
-    )
+    parser.add_argument("-p", "--password", default=DEFAULT_PASSWORD, help="iLO password (default: ILO_PASSWORD env). Use -p - to read from stdin. Default for targets in -f file that have no password on their line.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds for API calls (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--probe-timeout", type=int, default=PROBE_TIMEOUT, metavar="SEC", help=f"Timeout for iLO alive probe in seconds (default: {PROBE_TIMEOUT})")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument("--log-file", metavar="FILE", default=None, help="Append log messages to FILE (INFO level). Use with --verbose for DEBUG.")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose (DEBUG) logging. Use with --log-file to capture details.")
     parser.add_argument("--check", action="store_true", help="Compare current BIOS to desired profile (no changes); exit 0 if match, 1 if differ")
     parser.add_argument("--dry-run", action="store_true", help="Only print desired attributes; do not connect or PATCH")
     parser.add_argument("--no-reboot-prompt", action="store_true", help="Do not ask to reboot server after applying settings")
     parser.add_argument("--reboot", action="store_true", help="Reboot server after applying settings (no prompt)")
+    parser.add_argument("--skip-reboot", action="store_true", help="Never reboot (apply only). Use with automation or when rebooting via other means (e.g. rolling_restart).")
     parser.add_argument(
         "--reset-bios-to-default",
         action="store_true",
@@ -1211,6 +1807,19 @@ def main() -> int:
         metavar="FILE",
         default=None,
         help="Import certificate into Secure Boot Authorized Signature Database (db). e.g. Nutanix_Secure_Boot_v3.cer (PEM or DER). BIOS must be in User mode.",
+    )
+    parser.add_argument(
+        "--cert-db-export",
+        metavar="FILE",
+        default=None,
+        help="Export Secure Boot db certificate list (names, URIs, fingerprints) to JSON file. No BIOS apply.",
+    )
+    parser.add_argument(
+        "--yes",
+        "--non-interactive",
+        dest="non_interactive",
+        action="store_true",
+        help="Non-interactive: never prompt (e.g. for cert deletion when db full). Skip and exit with message instead.",
     )
     parser.add_argument(
         "--debug-secure-boot",
@@ -1252,16 +1861,68 @@ def main() -> int:
         action="store_true",
         help="When using --bios-settings-file: only apply if server model and CPU match the file header.",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format for --check and --fetch-bios-settings (and run summary when multi-target). Default: text.",
+    )
+    parser.add_argument("--bios-diff", action="store_true", help="With --check: only print attributes that differ from desired.")
+    parser.add_argument("--list-profiles", action="store_true", help="List available BIOS profile names from bios_profiles/ and exit.")
+    parser.add_argument(
+        "--validate-profile",
+        metavar="FILE",
+        default=None,
+        help="Validate a BIOS settings file (key=value format) and exit. No connection to iLO.",
+    )
+    parser.add_argument("--retries", type=int, default=MAX_ILO_RETRIES, metavar="N", help=f"Max API retries per iLO before skipping (default: {MAX_ILO_RETRIES}).")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Parallel workers for multiple iLOs (default: 1). When >1, reboot is skipped; use --reboot after run if needed.",
+    )
     args = parser.parse_args()
 
-    # Load per-IP passwords if --password-file given (fallback: args.password for IPs not in file)
-    args.password_map = {}
-    if getattr(args, "password_file", None):
+    # Password from stdin: -p - (read one line)
+    if getattr(args, "password", None) == "-":
         try:
-            args.password_map = _load_password_file(args.password_file)
-        except FileNotFoundError:
-            print(f"Error: Password file not found: {args.password_file}", file=sys.stderr)
-            return 2
+            args.password = sys.stdin.readline().rstrip("\n\r")
+        except (EOFError, OSError):
+            args.password = ""
+
+    # Configure logging (optional): --log-file writes to file; --verbose sets DEBUG
+    if getattr(args, "log_file", None):
+        level = logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
+        logger.setLevel(level)
+        logger.handlers.clear()
+        fh = logging.FileHandler(args.log_file, mode="a", encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(fh)
+    else:
+        logger.addHandler(logging.NullHandler())
+
+    # Per-IP passwords and usernames (from -f file when used; else empty, use -p and -u)
+    args.password_map = {}
+    args.username_map = {}
+
+    # --list-profiles: print profile names and exit
+    if getattr(args, "list_profiles", False):
+        for name in _list_profile_names():
+            print(name)
+        return 0
+
+    # --validate-profile: validate file and exit
+    if getattr(args, "validate_profile", None):
+        ok, errs = _validate_bios_settings_file(args.validate_profile)
+        if ok:
+            print("OK: File is valid.")
+            return 0
+        for e in errs:
+            print(e, file=sys.stderr)
+        return 2
 
     # --dry-run: show what would be applied; no targets or password required
     if args.dry_run:
@@ -1308,10 +1969,12 @@ def main() -> int:
             print("\nSecure Boot: disabled (--disable-secure-boot)")
         return 0
 
-    # Resolve target list: -f/--file or positional IPs
+    # Resolve target list: -f/--file or positional IPs. Same file can include optional username and password per line; missing -> use -u and -p.
     if args.file:
         try:
-            targets = _load_ips(args.file)
+            targets, file_passwords, file_usernames = _load_ips_passwords_usernames(args.file)
+            args.password_map = file_passwords
+            args.username_map = file_usernames
         except FileNotFoundError:
             print(f"Error: File not found: {args.file}", file=sys.stderr)
             return 2
@@ -1342,27 +2005,85 @@ def main() -> int:
     # With multiple hosts: no interactive reboot prompt; --reboot reboots all
     prompt_reboot = not args.no_reboot_prompt and not multi
     yes_reboot = args.reboot
+    if getattr(args, "skip_reboot", False):
+        prompt_reboot = False
+        yes_reboot = False
+
+    # --cert-db-export: export Secure Boot db cert list to JSON file
+    if getattr(args, "cert_db_export", None):
+        if not args.password and not args.password_map:
+            print("Error: Password required for --cert-db-export. Set ILO_PASSWORD, use -p, or set in -f file.", file=sys.stderr)
+            return 2
+        targets_data: List[Dict[str, Any]] = []
+        for i, ip in enumerate(targets, 1):
+            pwd = args.password_map.get(ip, args.password)
+            if not pwd:
+                if multi:
+                    print(f"[{i}/{len(targets)}] {ip}: No password; skipping.", file=sys.stderr)
+                continue
+            if multi:
+                print(f"[{i}/{len(targets)}] {ip} ...", file=sys.stderr)
+            user = args.username_map.get(ip, args.user)
+            if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+                continue
+            client = None
+            try:
+                kwargs = {"base_url": f"https://{ip}", "username": user, "password": pwd, "timeout": args.timeout}
+                if args.no_verify_ssl:
+                    kwargs["default_verify_cert"] = False
+                try:
+                    client = RedfishClient(**kwargs)
+                except TypeError:
+                    kwargs.pop("default_verify_cert", None)
+                    client = RedfishClient(**kwargs)
+                client.login()
+                entries = _list_secure_boot_db_certificates(client)
+                targets_data.append({"ilo_ip": ip, "certificates": [{"name": e.get("name") or "", "uri": e.get("uri") or "", "fingerprint": e.get("fingerprint")} for e in entries]})
+            except Exception as e:
+                print(f"  {ip}: {e}", file=sys.stderr)
+            finally:
+                if client is not None:
+                    try:
+                        client.logout()
+                    except Exception:
+                        pass
+        if not targets_data:
+            print("Error: Could not export cert db from any target.", file=sys.stderr)
+            return 1
+        try:
+            with open(args.cert_db_export, "w", encoding=FILE_ENCODING) as f:
+                if len(targets_data) == 1:
+                    json.dump(targets_data[0], f, indent=2)
+                else:
+                    json.dump({"targets": targets_data}, f, indent=2)
+            print(f"Exported Secure Boot db to {args.cert_db_export}")
+        except OSError as e:
+            print(f"Error writing {args.cert_db_export}: {e}", file=sys.stderr)
+            return 2
+        return 0
 
     # Fetch BIOS from first responsive node and exit (no apply)
     if args.fetch_bios_settings:
         if not args.password and not args.password_map:
-            print("Error: Password required for --fetch-bios-settings. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
+            print("Error: Password required for --fetch-bios-settings. Set ILO_PASSWORD, use -p, or set password in -f file.", file=sys.stderr)
             return 2
         no_write = getattr(args, "no_write", False)
         for i, ip in enumerate(targets, 1):
             pwd = args.password_map.get(ip, args.password)
             if not pwd:
                 if multi:
-                    print(f"[{i}/{len(targets)}] {ip}: No password; add to --password-file or set -p.", file=sys.stderr)
+                    print(f"[{i}/{len(targets)}] {ip}: No password; set in -f file or use -p.", file=sys.stderr)
                 continue
             if multi:
                 print(f"[{i}/{len(targets)}] Trying {ip} ...", file=sys.stderr)
-            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            user = args.username_map.get(ip, args.user)
+            if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 continue
             ok, msg = fetch_bios_settings(
-                ip, args.user, pwd, args.fetch_bios_settings,
+                ip, user, pwd, args.fetch_bios_settings,
                 timeout=args.timeout, verify_ssl=not args.no_verify_ssl,
                 no_write=no_write,
+                output_format=getattr(args, "output_format", "text"),
             )
             if ok:
                 print(msg)
@@ -1373,25 +2094,26 @@ def main() -> int:
 
     if args.reset_bios_to_default:
         if not args.password and not args.password_map:
-            print("Error: Password required for --reset-bios-to-default. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
+            print("Error: Password required for --reset-bios-to-default. Set ILO_PASSWORD, use -p, or set in -f file.", file=sys.stderr)
             return 2
         print("Note: For nodes in a Nutanix cluster with running workloads, use rolling_restart -h on the CVM to restart nodes safely.")
         any_fail = 0
         for i, ip in enumerate(targets, 1):
             pwd = args.password_map.get(ip, args.password)
             if not pwd:
-                print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
+                print(f"No password for {ip}; set in -f file or use -p/ILO_PASSWORD.", file=sys.stderr)
                 any_fail = 1
                 continue
             if multi:
                 print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            user = args.username_map.get(ip, args.user)
+            if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 print(f"iLO at {ip} not responding, skipping.", file=sys.stderr)
                 any_fail = 1
                 continue
             client = None
             try:
-                kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": pwd, "timeout": args.timeout}
+                kwargs = {"base_url": f"https://{ip}", "username": user, "password": pwd, "timeout": args.timeout}
                 if not args.no_verify_ssl:
                     pass
                 else:
@@ -1422,12 +2144,13 @@ def main() -> int:
         ip = targets[0]
         pwd = args.password_map.get(ip, args.password)
         if not pwd:
-            print("Error: Password required for --debug-secure-boot. Set ILO_PASSWORD or use -p, or add this host to --password-file.", file=sys.stderr)
+            print("Error: Password required for --debug-secure-boot. Set ILO_PASSWORD or use -p, or set in -f file.", file=sys.stderr)
             return 2
-        if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+        user = args.username_map.get(ip, args.user)
+        if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
             print(f"iLO at {ip} not responding.", file=sys.stderr)
             return 1
-        kwargs = {"base_url": f"https://{ip}", "username": args.user, "password": pwd, "timeout": args.timeout}
+        kwargs = {"base_url": f"https://{ip}", "username": user, "password": pwd, "timeout": args.timeout}
         if not args.no_verify_ssl:
             pass
         else:
@@ -1450,7 +2173,7 @@ def main() -> int:
 
     if args.check:
         if not args.password and not args.password_map:
-            print("Error: iLO password required for --check. Set ILO_PASSWORD, use -p, or provide --password-file.", file=sys.stderr)
+            print("Error: iLO password required for --check. Set ILO_PASSWORD, use -p, or set in -f file.", file=sys.stderr)
             return 2
         check_cert_pem: Optional[str] = None
         if args.secure_boot_cert:
@@ -1473,12 +2196,13 @@ def main() -> int:
         for i, ip in enumerate(targets, 1):
             pwd = args.password_map.get(ip, args.password)
             if not pwd:
-                print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
+                print(f"No password for {ip}; set in -f file or use -p/ILO_PASSWORD.", file=sys.stderr)
                 any_fail = 1
                 continue
             if multi:
                 print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-            if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            user = args.username_map.get(ip, args.user)
+            if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
                 print(f"iLO at {ip} not responding (timeout/unreachable), skipping.", file=sys.stderr)
                 any_fail = 1
                 continue
@@ -1489,7 +2213,7 @@ def main() -> int:
                 extra = {"SecureBootEnable": False, **SECURE_BOOT_DISABLED_ATTRIBUTES}
             code = check_bios(
                 ip,
-                args.user,
+                user,
                 pwd,
                 timeout=args.timeout,
                 verify_ssl=not args.no_verify_ssl,
@@ -1497,13 +2221,15 @@ def main() -> int:
                 cert_pem=check_cert_pem,
                 base_desired=check_base,
                 profile_name=args.bios_profile or args.bios_settings_file,
+                bios_diff=getattr(args, "bios_diff", False),
+                output_format=getattr(args, "output_format", "text"),
             )
             if code != 0:
                 any_fail = 1
         return any_fail
 
     if not args.password and not args.password_map:
-        print("Error: iLO password required. Set ILO_PASSWORD, use -p, or provide --password-file with an entry per target.", file=sys.stderr)
+        print("Error: iLO password required. Set ILO_PASSWORD, use -p, or set password per target in -f file.", file=sys.stderr)
         return 2
 
     desired_from_file: Optional[Dict[str, str]] = None
@@ -1553,29 +2279,37 @@ def main() -> int:
             print(f"Error loading certificate: {e}", file=sys.stderr)
             return 2
 
-    any_fail = 0
-    for i, ip in enumerate(targets, 1):
+    max_retries = max(1, getattr(args, "retries", MAX_ILO_RETRIES))
+    skip_reboot_run = prompt_reboot is False and yes_reboot is False
+    if getattr(args, "workers", 1) > 1:
+        skip_reboot_run = True  # never reboot when using parallel workers
+    non_interactive = getattr(args, "non_interactive", False)
+    workers = max(1, getattr(args, "workers", 1))
+
+    success_list: List[str] = []
+    failed_list: List[str] = []
+    skipped_list: List[str] = []
+
+    def _process_one(ip: str) -> Tuple[str, int]:
+        """Process one iLO; returns (ip, exit_code)."""
         pwd = args.password_map.get(ip, args.password)
         if not pwd:
-            print(f"No password for {ip}; add to --password-file or set -p/ILO_PASSWORD.", file=sys.stderr)
-            any_fail = 1
-            continue
-        if multi:
-            print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
-        if not probe_ilo_alive(ip, args.user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
-            print(f"iLO at {ip} not responding (timeout/unreachable), skipping.", file=sys.stderr)
-            any_fail = 1
-            continue
+            return (ip, -1)  # -1 = skipped (no password)
+        user = args.username_map.get(ip, args.user)
+        if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+            return (ip, -1)  # skipped (unreachable)
         code = 1
-        for attempt in range(MAX_ILO_RETRIES):
+        for attempt in range(max_retries):
             code, _ = set_bios(
                 ip,
-                args.user,
+                user,
                 pwd,
                 timeout=args.timeout,
                 verify_ssl=not args.no_verify_ssl,
                 prompt_reboot=prompt_reboot,
                 yes_reboot=yes_reboot,
+                skip_reboot=skip_reboot_run,
+                non_interactive=non_interactive,
                 attribute_overrides=overrides if overrides else None,
                 always_apply_keys=always_apply_keys,
                 cert_pem=cert_pem,
@@ -1588,11 +2322,106 @@ def main() -> int:
             )
             if code == 0:
                 break
-            if attempt + 1 < MAX_ILO_RETRIES:
-                print(f"  Retry {attempt + 2}/{MAX_ILO_RETRIES} for {ip} ...", file=sys.stderr)
-        if code != 0:
-            print(f"Skipping {ip} after {MAX_ILO_RETRIES} failed attempt(s).", file=sys.stderr)
-            any_fail = 1
+            if cert_pem:
+                break
+            if attempt + 1 < max_retries:
+                print(f"  Retry {attempt + 2}/{max_retries} for {ip} ...", file=sys.stderr)
+        return (ip, code)
+
+    if workers > 1:
+        # Parallel: submit all, collect results (output may interleave).
+        # Timeout so one stuck host does not hang the run: allow (timeout * retries + buffer) per target.
+        parallel_timeout = (args.timeout * max_retries + 120) * max(1, len(targets))
+        if multi:
+            print(f"Using {workers} parallel workers (reboot skipped).")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_ip = {executor.submit(_process_one, ip): ip for ip in targets}
+            try:
+                done_futures = set()
+                for future in as_completed(future_to_ip.keys(), timeout=parallel_timeout):
+                    done_futures.add(future)
+                    ip = future_to_ip[future]
+                    try:
+                        _, code = future.result()
+                    except Exception as e:
+                        print(f"  {ip}: {e}", file=sys.stderr)
+                        logger.exception("Parallel worker failed for %s", ip)
+                        failed_list.append(ip)
+                        continue
+                    if code == -1:
+                        skipped_list.append(ip)
+                    elif code == 0:
+                        success_list.append(ip)
+                    else:
+                        failed_list.append(ip)
+            except TimeoutError:
+                for future, ip in future_to_ip.items():
+                    if future not in done_futures:
+                        print(f"  {ip}: timed out (parallel run exceeded {parallel_timeout}s)", file=sys.stderr)
+                        failed_list.append(ip)
+                        future.cancel()
+    else:
+        # Sequential
+        for i, ip in enumerate(targets, 1):
+            pwd = args.password_map.get(ip, args.password)
+            if not pwd:
+                print(f"No password for {ip}; set in -f file or use -p/ILO_PASSWORD.", file=sys.stderr)
+                skipped_list.append(ip)
+                continue
+            if multi:
+                print(f"\n{'='*60}\n[{i}/{len(targets)}] {ip}\n{'='*60}")
+            user = args.username_map.get(ip, args.user)
+            if not probe_ilo_alive(ip, user, pwd, timeout=args.probe_timeout, verify_ssl=not args.no_verify_ssl):
+                print(f"iLO at {ip} not responding (timeout/unreachable), skipping.", file=sys.stderr)
+                skipped_list.append(ip)
+                continue
+            logger.info("Processing target %s (%s/%s)", ip, i, len(targets))
+            code = 1
+            for attempt in range(max_retries):
+                code, _ = set_bios(
+                    ip,
+                    user,
+                    pwd,
+                    timeout=args.timeout,
+                    verify_ssl=not args.no_verify_ssl,
+                    prompt_reboot=prompt_reboot,
+                    yes_reboot=yes_reboot,
+                    skip_reboot=skip_reboot_run,
+                    non_interactive=non_interactive,
+                    attribute_overrides=overrides if overrides else None,
+                    always_apply_keys=always_apply_keys,
+                    cert_pem=cert_pem,
+                    enable_secure_boot_resource=args.enable_secure_boot,
+                    disable_secure_boot_resource=args.disable_secure_boot,
+                    desired_from_file=desired_from_file,
+                    file_metadata=file_metadata,
+                    match_model_cpu=args.match_model_cpu,
+                    profile_name=args.bios_profile or args.bios_settings_file,
+                )
+                if code == 0:
+                    success_list.append(ip)
+                    break
+                if cert_pem:
+                    failed_list.append(ip)
+                    break
+                if attempt + 1 < max_retries:
+                    print(f"  Retry {attempt + 2}/{max_retries} for {ip} ...", file=sys.stderr)
+            if code != 0 and ip not in success_list and ip not in failed_list:
+                print(f"Skipping {ip} after {max_retries} failed attempt(s).", file=sys.stderr)
+                failed_list.append(ip)
+
+    any_fail = 1 if failed_list or skipped_list else 0
+    if multi and (success_list or failed_list or skipped_list):
+        out_fmt = getattr(args, "output_format", "text")
+        if out_fmt == "json":
+            print(json.dumps({"success": success_list, "failed": failed_list, "skipped": skipped_list}, indent=2))
+        else:
+            print(f"\n--- Summary ---")
+            print(f"Success: {len(success_list)}  Failed: {len(failed_list)}  Skipped: {len(skipped_list)}")
+            if failed_list:
+                print(f"Failed: {', '.join(failed_list)}")
+            if skipped_list:
+                print(f"Skipped: {', '.join(skipped_list)}")
     return any_fail
 
 
