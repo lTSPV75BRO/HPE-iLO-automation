@@ -198,6 +198,9 @@ python HPE_set_bios.py -f ips.txt -p 'your_password' --reset-bios-to-default [--
 | `--enable-secure-boot` | Enable Secure Boot (Redfish + BIOS attributes) |
 | `--disable-secure-boot` | Disable Secure Boot |
 | `--secure-boot-cert FILE` | Import certificate into Secure Boot db (e.g. Nutanix .cer); BIOS in User mode required. Skips POST if cert already in db. |
+| `--cert-verify-initial-delay SEC` | After cert POST (200/202), wait before first db check (default: 4). Increase for slow/async iLO. |
+| `--cert-verify-retry-delay SEC` | Delay between db verification polls (default: 2). |
+| `--cert-verify-retries N` | How many times to poll the db for the cert after POST (default: 5). |
 | `--cert-db-export FILE` | Export Secure Boot db certificate list (names, URIs, fingerprints) to JSON file; no BIOS apply |
 | `--yes`, `--non-interactive` | Never prompt (e.g. when Secure Boot db full and no legacy certs to remove); skip and exit with message |
 | `--reboot` | Reboot server(s) after applying (no prompt) |

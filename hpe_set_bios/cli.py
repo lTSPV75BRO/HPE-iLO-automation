@@ -57,7 +57,7 @@ if sys.version_info < (3, 6):
 # Suppress urllib3 NotOpenSSLWarning on systems where Python's ssl is linked to LibreSSL
 warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL.*")
 
-__version__ = "1.0.2"
+__version__ = "1.0.0"
 
 try:
     from redfish import RedfishClient
@@ -1018,6 +1018,24 @@ SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC = 4
 SECURE_BOOT_CERT_VERIFY_RETRIES = 5
 
 
+def _cert_accepted_but_not_verified_in_db(status: Optional[int]) -> bool:
+    """
+    Return False after cert POST succeeded (200/201/202/204) but _verify_cert_in_secure_boot_db
+    never saw the cert. Do not treat this as success: 202 especially means async work may still be pending.
+    """
+    st = status if status is not None else "?"
+    print(
+        f"  HTTP {st}: upload accepted but certificate was NOT visible in the Secure Boot db after verification retries.",
+        file=sys.stderr,
+    )
+    print(
+        "  202 Accepted is asynchronous: the import may finish later or only after host reboot. "
+        "Re-run after reboot or confirm in iLO (Security → Secure Boot → Authorized Signatures).",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _pem_to_64_char_lines(pem: str) -> str:
     """Return PEM with base64 body wrapped to 64 chars per line (some iLOs require this)."""
     b64 = _normalize_cert_pem_for_compare(pem)
@@ -1100,8 +1118,21 @@ def _cert_response_error_body(resp: Any) -> str:
     return ""
 
 
-def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool = False) -> bool:
+def _import_secure_boot_cert(
+    client: Any,
+    cert_pem: str,
+    non_interactive: bool = False,
+    *,
+    verify_initial_delay_sec: Optional[float] = None,
+    verify_retry_delay_sec: Optional[float] = None,
+    verify_retries: Optional[int] = None,
+) -> bool:
     """POST certificate to Secure Boot Authorized Signature Database (db). Tries multiple URIs and payload formats. Returns True on success or if cert already in db. BIOS must be in User mode."""
+    init_sec = float(
+        verify_initial_delay_sec if verify_initial_delay_sec is not None else SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC
+    )
+    retry_sec = float(verify_retry_delay_sec if verify_retry_delay_sec is not None else SECURE_BOOT_CERT_RETRY_DELAY_SEC)
+    n_verify = int(verify_retries if verify_retries is not None else SECURE_BOOT_CERT_VERIFY_RETRIES)
     # Idempotent: skip POST if cert is already in db (by fingerprint)
     if _verify_cert_in_secure_boot_db(client, cert_pem):
         print("Certificate already in Secure Boot db; no change needed.")
@@ -1159,15 +1190,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                     if status in (200, 201, 202, 204):
                         logger.info("Cert accepted: status=%s", status)
                         print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                        time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                        for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                        time.sleep(init_sec)
+                        for v in range(n_verify):
                             if _verify_cert_in_secure_boot_db(client, cert_pem):
                                 print("Certificate verified: present in iLO Secure Boot db.")
                                 return True
-                            if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                        print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
-                        return True
+                            if v < n_verify - 1:
+                                time.sleep(retry_sec)
+                        return _cert_accepted_but_not_verified_in_db(status)
                     if status and 400 <= status < 500:
                         if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
                             time.sleep(1)
@@ -1196,15 +1226,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                                     if st2 in (200, 201, 202, 204):
                                         logger.info("Cert accepted after removing legacy certs: status=%s", st2)
                                         print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                                        time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                                        for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                        time.sleep(init_sec)
+                                        for v in range(n_verify):
                                             if _verify_cert_in_secure_boot_db(client, cert_pem):
                                                 print("Certificate verified: present in iLO Secure Boot db.")
                                                 return True
-                                            if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                                time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                                        print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
-                                        return True
+                                            if v < n_verify - 1:
+                                                time.sleep(retry_sec)
+                                        return _cert_accepted_but_not_verified_in_db(st2)
                                 except Exception:
                                     pass
                         print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
@@ -1233,15 +1262,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                         if status in (200, 201, 202, 204):
                             logger.info("Cert accepted: status=%s", status)
                             print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                            time.sleep(init_sec)
+                            for v in range(n_verify):
                                 if _verify_cert_in_secure_boot_db(client, cert_pem):
                                     print("Certificate verified: present in iLO Secure Boot db.")
                                     return True
-                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                            print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
-                            return True
+                                if v < n_verify - 1:
+                                    time.sleep(retry_sec)
+                            return _cert_accepted_but_not_verified_in_db(status)
                         if status and 400 <= status < 500:
                             if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
                                 time.sleep(1)
@@ -1267,14 +1295,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                                         st2 = getattr(resp2, "status", None)
                                         if st2 in (200, 201, 202, 204):
                                             print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                            time.sleep(init_sec)
+                                            for v in range(n_verify):
                                                 if _verify_cert_in_secure_boot_db(client, cert_pem):
                                                     print("Certificate verified: present in iLO Secure Boot db.")
                                                     return True
-                                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                                            return True
+                                                if v < n_verify - 1:
+                                                    time.sleep(retry_sec)
+                                            return _cert_accepted_but_not_verified_in_db(st2)
                                     except Exception:
                                         pass
                             print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
@@ -1296,15 +1324,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                         if status in (200, 201, 202, 204):
                             logger.info("Cert accepted: status=%s", status)
                             print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                            time.sleep(init_sec)
+                            for v in range(n_verify):
                                 if _verify_cert_in_secure_boot_db(client, cert_pem):
                                     print("Certificate verified: present in iLO Secure Boot db.")
                                     return True
-                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                            print("Certificate import reported success; re-check db in iLO if needed.", file=sys.stderr)
-                            return True
+                                if v < n_verify - 1:
+                                    time.sleep(retry_sec)
+                            return _cert_accepted_but_not_verified_in_db(status)
                         if status and 400 <= status < 500:
                             if not any(mid in (resp_text or "") for mid in SECURE_BOOT_DB_LIMIT_MESSAGE_IDS):
                                 time.sleep(1)
@@ -1330,14 +1357,14 @@ def _import_secure_boot_cert(client: Any, cert_pem: str, non_interactive: bool =
                                         st2 = getattr(resp2, "status", None)
                                         if st2 in (200, 201, 202, 204):
                                             print("Secure Boot certificate accepted by iLO (import to Authorized Signature Database).")
-                                            time.sleep(SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC)
-                                            for v in range(SECURE_BOOT_CERT_VERIFY_RETRIES):
+                                            time.sleep(init_sec)
+                                            for v in range(n_verify):
                                                 if _verify_cert_in_secure_boot_db(client, cert_pem):
                                                     print("Certificate verified: present in iLO Secure Boot db.")
                                                     return True
-                                                if v < SECURE_BOOT_CERT_VERIFY_RETRIES - 1:
-                                                    time.sleep(SECURE_BOOT_CERT_RETRY_DELAY_SEC)
-                                            return True
+                                                if v < n_verify - 1:
+                                                    time.sleep(retry_sec)
+                                            return _cert_accepted_but_not_verified_in_db(st2)
                                     except Exception:
                                         pass
                             print(f"  Cert POST {uri}: {last_err}", file=sys.stderr)
@@ -1379,6 +1406,9 @@ def set_bios(
     file_metadata: Optional[Dict[str, str]] = None,
     match_model_cpu: bool = False,
     profile_name: Optional[str] = None,
+    cert_verify_initial_delay_sec: Optional[float] = None,
+    cert_verify_retry_delay_sec: Optional[float] = None,
+    cert_verify_retries: Optional[int] = None,
 ) -> Tuple[int, Optional[Any]]:
     """
     Connect to iLO, compare current BIOS with desired, PATCH only differences,
@@ -1477,7 +1507,14 @@ def set_bios(
                 _enable_secure_boot_resource(client)
             if cert_pem:
                 print("Note: Certificate enrollment requires BIOS/Platform to be in User mode.")
-                cert_ok = _import_secure_boot_cert(client, cert_pem, non_interactive)
+                cert_ok = _import_secure_boot_cert(
+                    client,
+                    cert_pem,
+                    non_interactive,
+                    verify_initial_delay_sec=cert_verify_initial_delay_sec,
+                    verify_retry_delay_sec=cert_verify_retry_delay_sec,
+                    verify_retries=cert_verify_retries,
+                )
                 if not cert_ok:
                     print("Error: Secure Boot certificate enrollment failed; skipping server.", file=sys.stderr)
                     return 1, client
@@ -1512,7 +1549,14 @@ def set_bios(
         # 3. Import certificate to Secure Boot db if requested (BIOS must be in User mode)
         if cert_pem:
             print("Note: Certificate enrollment requires BIOS/Platform to be in User mode.")
-            cert_ok = _import_secure_boot_cert(client, cert_pem, non_interactive)
+            cert_ok = _import_secure_boot_cert(
+                client,
+                cert_pem,
+                non_interactive,
+                verify_initial_delay_sec=cert_verify_initial_delay_sec,
+                verify_retry_delay_sec=cert_verify_retry_delay_sec,
+                verify_retries=cert_verify_retries,
+            )
             if not cert_ok:
                 print("Error: Secure Boot certificate enrollment failed; skipping server.", file=sys.stderr)
                 return 1, client
@@ -1807,6 +1851,27 @@ def main() -> int:
         metavar="FILE",
         default=None,
         help="Import certificate into Secure Boot Authorized Signature Database (db). e.g. Nutanix_Secure_Boot_v3.cer (PEM or DER). BIOS must be in User mode.",
+    )
+    parser.add_argument(
+        "--cert-verify-initial-delay",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=f"After cert POST (200/202), wait this many seconds before first db verification (default: {SECURE_BOOT_CERT_VERIFY_INITIAL_DELAY_SEC}). Use higher values for slow/async iLO.",
+    )
+    parser.add_argument(
+        "--cert-verify-retry-delay",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=f"Seconds between db verification retries (default: {SECURE_BOOT_CERT_RETRY_DELAY_SEC}).",
+    )
+    parser.add_argument(
+        "--cert-verify-retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"How many times to poll the Secure Boot db for the cert after POST (default: {SECURE_BOOT_CERT_VERIFY_RETRIES}).",
     )
     parser.add_argument(
         "--cert-db-export",
@@ -2280,6 +2345,9 @@ def main() -> int:
             return 2
 
     max_retries = max(1, getattr(args, "retries", MAX_ILO_RETRIES))
+    cert_verify_initial_delay_sec = getattr(args, "cert_verify_initial_delay", None)
+    cert_verify_retry_delay_sec = getattr(args, "cert_verify_retry_delay", None)
+    cert_verify_retries_opt = getattr(args, "cert_verify_retries", None)
     skip_reboot_run = prompt_reboot is False and yes_reboot is False
     if getattr(args, "workers", 1) > 1:
         skip_reboot_run = True  # never reboot when using parallel workers
@@ -2319,6 +2387,9 @@ def main() -> int:
                 file_metadata=file_metadata,
                 match_model_cpu=args.match_model_cpu,
                 profile_name=args.bios_profile or args.bios_settings_file,
+                cert_verify_initial_delay_sec=cert_verify_initial_delay_sec,
+                cert_verify_retry_delay_sec=cert_verify_retry_delay_sec,
+                cert_verify_retries=cert_verify_retries_opt,
             )
             if code == 0:
                 break
@@ -2397,6 +2468,9 @@ def main() -> int:
                     file_metadata=file_metadata,
                     match_model_cpu=args.match_model_cpu,
                     profile_name=args.bios_profile or args.bios_settings_file,
+                    cert_verify_initial_delay_sec=cert_verify_initial_delay_sec,
+                    cert_verify_retry_delay_sec=cert_verify_retry_delay_sec,
+                    cert_verify_retries=cert_verify_retries_opt,
                 )
                 if code == 0:
                     success_list.append(ip)
